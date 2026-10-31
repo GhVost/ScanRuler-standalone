@@ -1,0 +1,36 @@
+{
+  "name": "scanruler-desktop",
+  "private": true,
+  "version": "0.9.2",
+  "description": "ScanRuler desktop wrapper",
+  "author": "Stefan Hermann (CNC Kitchen)",
+  "license": "AGPL-3.0-only",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "npm --prefix .. run build && electron-builder --win portable nsis"
+  },
+  "build": {
+    "appId": "com.cnckitchen.scanruler",
+    "productName": "ScanRuler",
+    "files": [
+      "main.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "web"
+      }
+    ],
+    "win": {
+      "icon": "icon.png"
+    },
+    "directories": {
+      "output": "release"
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  }
+}
