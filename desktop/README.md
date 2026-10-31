@@ -23,6 +23,30 @@ Output in `desktop/release/`:
 If `ELECTRON_RUN_AS_NODE` is set in your environment, unset it first, or
 Electron starts as plain Node.
 
+## Release
+
+CI runs only for releases. Set `version` in `desktop/package.json` (keep it
+the same as the root `package.json`), commit, then tag and push:
+
+```sh
+git tag desktop-v0.9.2
+git push origin desktop-v0.9.2
+```
+
+The [Desktop release](../.github/workflows/desktop-release.yml) workflow
+runs the tests, builds both exes on Windows and attaches them to a GitHub
+release of that tag.
+
+## Upstream updates
+
+`upstream` is CNC Kitchen's repo. To take a new version:
+
+```sh
+git pull upstream main
+```
+
+then bump `desktop/package.json` to the new version, rebuild and test.
+
 ## Differences from scanruler.com
 
 - Short links (`/s/<name>`) need the website and do not open here.

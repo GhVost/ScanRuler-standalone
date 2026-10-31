@@ -36,6 +36,7 @@ on:
 
 jobs:
   npm-licenses:
+    if: ${{ github.repository == 'CNCKitchen/scanruler' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
