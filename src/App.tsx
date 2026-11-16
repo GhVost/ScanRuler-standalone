@@ -8,7 +8,8 @@
 // its edges, project files, each plugin's hook (called in the same order
 // every render) and the agent connection.
 
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { BufferGeometry } from 'three'
 import { useProjectHistory } from './app/useProjectHistory'
 import { clearHistory, historyAction } from './state/historyStore'
 import { MeshWorkerClient } from './core/workerClient'
@@ -69,19 +70,20 @@ import { FlatPanel } from './ui/FlatPanel'
 import { FlatViewer } from './ui/FlatViewer'
 import type { FlatScene } from './viewer/FlatScene'
 import { MapLegend, type LegendStat } from './ui/MapLegend'
+import { fetchSampleScan } from './app/sampleScan'
 import { StartPane, type StartSlot } from './ui/StartPane'
 import { CompareView } from './ui/CompareView'
 import { formatSigned } from './ui/format'
 import { HoverReadout, type HoverReading } from './ui/HoverReadout'
 import { SplitPicker } from './ui/SplitPicker'
-import { MARK_COLOR, useDeviation } from './state/deviationStore'
+import { MARK_COLOR, mapHeld, useDeviation } from './state/deviationStore'
 import { usePrefs } from './state/prefsStore'
 import { boundLength, useLength } from './app/useUnits'
 import { lengthInputText, unitWord, type DisplayUnits } from './core/units'
 import { useShell } from './state/shellStore'
 import { useMark } from './state/markStore'
 import { useThickness } from './state/thicknessStore'
-import { imageScaleX, useFlat } from './state/flatStore'
+import { edgesSettled, imageScaleX, useFlat } from './state/flatStore'
 import { sectionViewFrames, useSectionView } from './state/sectionViewStore'
 import type { FieldScale } from './core/field/colormap'
 import { deviationScale } from './core/deviation/deviation'
@@ -90,8 +92,7 @@ import { rigidToColumnMajor } from './core/deviation/rigid'
 import { exportElementsStep, exportScanMesh, exportScanPointCloud, runExport, saveBuilt, textBytes, type BuiltFile } from './app/exports'
 import type { MeshFormat } from './core/exportMesh'
 import { PICK_MARK_TOOL_STATUS } from './app/deviationWorkspace'
-import { useElementField } from './app/useElementField'
-import { useSceneSync } from './app/useSceneSync'
+import { SceneSync } from './app/SceneSync'
 import { createSession, type AppSession } from './app/session'
 import { installCommandHost, type FlatHost, type FlatSheetView, type ProjectHost } from './commands/host'
 import { commandRunning } from './commands/activity'
@@ -100,7 +101,7 @@ import { creaseNote } from './app/scanImport'
 import { useFlatSceneSync, type SheetView } from './app/useFlatSceneSync'
 import { buildFlatCsvFile, drawnSummary, flatExportStem, flatReportInput } from './app/flatReport'
 import { sheetAlignment, sheetElements, sheetFrame, sheetLoupeActive, sheetNotes, sheetPoseOf, sheetScale } from './app/flatSheet'
-import { useHintChip } from './app/useHints'
+import { HintsProvider, useHintChip } from './app/useHints'
 import { useGlobalShortcuts } from './app/useGlobalShortcuts'
 import { useDragDrop } from './app/useDragDrop'
 import { useOpenFromAddress } from './app/useOpenFromAddress'
@@ -117,7 +118,18 @@ const NO_RUNTIME: PluginRuntime = {}
  *  split for it again, ms: a slider dragged across splits it once. */
 const CREASE_SETTLE_MS = 250
 
+/** The hint ladder is asked once, here, and handed down to every control that
+ *  can ring (usePulse) and to the chip over the model (useHintChip). It sits
+ *  above the whole app so a portal or a plugin's panel is under it too. */
 export default function App() {
+  return (
+    <HintsProvider>
+      <Workbench />
+    </HintsProvider>
+  )
+}
+
+function Workbench() {
   const clientRef = useRef<MeshWorkerClient | null>(null)
   if (!clientRef.current) clientRef.current = new MeshWorkerClient()
   const sceneRef = useRef<SceneManager | null>(null)
@@ -144,7 +156,17 @@ export default function App() {
     cancelDraft: handleCancelDraft,
     findSymmetry: handleFindSymmetry,
   } = session.measure
-  const { commitScan, openScan: openFile } = session.scan
+  const { commitScan, openScan } = session.scan
+  /** A scan the person opens: asked about first when the session holds
+   *  measurements on the scan in place, which a new scan clears — opening
+   *  one let them go without a word (pull request 23, issue 34). An agent
+   *  opens through scan.open, whose discard says it. */
+  const openFile = (file: File) =>
+    openScan(file, undefined, () => {
+      const s = useStore.getState()
+      const held = s.elements.length + s.dimensions.length + s.sections.length
+      return held === 0 || window.confirm(`Opening ${file.name} replaces the scan, and the ${held === 1 ? 'measurement' : `${held} measurements`} on it — elements, dimensions and sections — go with it. Continue?`)
+    })
   // In development the viewport, the worker and the Measure store are
   // reachable from the console and the browser checks — nothing in a
   // production build.
@@ -157,8 +179,8 @@ export default function App() {
   }
   // The 2D Measure viewport and its decoded scan image. The bitmap stays out
   // of the store like every other big buffer; the scene ref is separate from
-  // sceneRef because this viewport, unlike the 3D one, mounts and unmounts
-  // with its workspace.
+  // sceneRef because this viewport, unlike the 3D one, does not exist until
+  // its workspace has first been opened.
   const flatSceneRef = useRef<FlatScene | null>(null)
   const flatBitmapRef = useRef<ImageBitmap | null>(null)
   // Edge detection: its own worker, the grayscale cached for sensitivity
@@ -264,13 +286,23 @@ export default function App() {
     clearHistory()
   }
 
-  const openImage = (file: File) => runImport(imports, 'Reading image…', async () => {
+  const openImage = (file: File, shouldStart?: () => boolean) => runImport(imports, 'Reading image…', async () => {
     const image = await prepareImage(file)
     commitImage(image)
     useShell.getState().setWorkspace('flat')
     void runEdgeDetect()
     useStore.getState().setStatus(`Image loaded — ${file.name}.`)
-  })
+  }, shouldStart)
+
+  /** An image the person opens: asked about first when the image sheet holds
+   *  measurements, which a new image clears (issue 34's pull request 23). */
+  const openImageAsking = (file: File) =>
+    openImage(file, () => {
+      const f = useFlat.getState()
+      const sheet = f.subject.kind === 'image' ? f : f.sheets.image
+      const held = sheet ? sheet.elements.length + sheet.dimensions.length + sheet.counts.length + sheet.notes.length : 0
+      return held === 0 || window.confirm(`Opening ${file.name} replaces the image, and the ${held === 1 ? 'item' : `${held} items`} measured on it — elements, dimensions, counts and notes — go with it. Continue?`)
+    })
 
   /** A section laid flat for the 2D sheet: its cut projected into its own
    *  plane, indexed for snapping, and the bounds of a sheet with room round
@@ -610,10 +642,19 @@ export default function App() {
     selectTarget: handleSelectTarget,
   } = session.deviation
 
+  /** A reference the person opens: asked about first when the session holds
+   *  a best fit to the one in place or pins on its map, which a new
+   *  reference clears. Compare in Deviation opens its own and is not asked. */
+  const openNominalAsking = (file: File) =>
+    openNominal(file, undefined, {}, () => {
+      const d = useDeviation.getState()
+      if (!d.nominalName) return true
+      const lose = [d.align ? 'the best-fit alignment to it' : null, d.probes.length > 0 ? `${d.probes.length === 1 ? 'the pin' : `${d.probes.length} pins`} on its map` : null].filter(Boolean)
+      return lose.length === 0 || window.confirm(`Opening ${file.name} replaces the reference part. Lost with it: ${lose.join(' and ')}. Continue?`)
+    })
+
   // ---- Deviation from a fitted element -------------------------------------
-
-  useElementField({ sceneRef, elementField, elementRgb, elementScope, fieldDirections })
-
+  // The map against an element follows its target in SceneSync, below.
 
   /** Switch the element map between measuring the whole scan and measuring a
    *  hand-marked region of it. Choosing the marked scope opens the marking
@@ -667,7 +708,7 @@ export default function App() {
   // app/scanSwap.
   const { swapScan, remapScan, remeasureScan } = session.swap
 
-  hostVerbs.current = { openScan: openFile, openReference: openNominal, runFit, runDeviation, runThickness, clearPreview, swapScan, remapScan, remeasureScan }
+  hostVerbs.current = { openScan, openReference: openNominal, runFit, runDeviation, runThickness, clearPreview, swapScan, remapScan, remeasureScan }
 
   useProjectHistory({ clientRef, sceneRef, elementScope, deviation, deviationRgb, referenceMap: maps.referenceMap, referenceRgb: maps.referenceRgb,
     thickness, thicknessRgb, imports, sources, runFit, runDeviation, runThickness, swapScan, remeasureScan })
@@ -736,6 +777,11 @@ export default function App() {
     }
     const faceVertices = hit.vertices
     if (!store.fileName || store.busy) return
+    // A row of the Scale part box collecting two points takes the raw click.
+    if (store.scaleDraft?.pickRow != null && !store.draft) {
+      store.addScalePick(hit.point)
+      return
+    }
     // A slot of the alignment editor collecting points takes the raw click.
     if (store.alignDraft?.pickSlot) {
       store.addAlignmentPick(hit.point, hit.normal)
@@ -1208,13 +1254,15 @@ export default function App() {
     // Runs on the listed dependencies only, not on everything it reads.
   }, [draftOpen, windowKey])
 
-  // Everything the scene is told after a render lives in useSceneSync; the
-  // subscriptions here are the ones the JSX below still reads itself.
+  // Everything the scene is told after a render lives in useSceneSync, called
+  // from SceneSync so its subscriptions wake that and not this; the ones here
+  // are the ones the JSX below still reads itself.
   const elements = useStore((s) => s.elements)
   const storeSections = useStore((s) => s.sections)
   const draft = useStore((s) => s.draft)
   const dimDraft = useStore((s) => s.dimDraft)
   const alignDraft = useStore((s) => s.alignDraft)
+  const scaleDraft = useStore((s) => s.scaleDraft)
   const sectionDraft = useStore((s) => s.sectionDraft)
   // Whether a fit draft is collecting its surface by hand — it decides which
   // hint rides above the model.
@@ -1226,6 +1274,7 @@ export default function App() {
   )
   const marking = useDeviation((s) => s.marking)
   const markGesture = useMark((s) => s.gesture)
+  const markStraight = useMark((s) => s.straight)
   const workspace = useShell((s) => s.workspace)
   const range = useDeviation((s) => s.range)
   const maxDistance = useDeviation((s) => s.maxDistance)
@@ -1251,22 +1300,6 @@ export default function App() {
   const picking = useDeviation((s) => s.picking)
   const split = useDeviation((s) => s.split)
   const hasThicknessMap = useThickness((s) => s.status === 'ready')
-
-  useSceneSync({
-    sceneRef,
-    deviation,
-    deviationRgb,
-    referenceMap: maps.referenceMap,
-    referenceRgb: maps.referenceRgb,
-    elementField,
-    elementRgb,
-    fieldDirections,
-    thickness,
-    thicknessRgb,
-    thickScale,
-    plugin: active,
-    cancelDraft: handleCancelDraft,
-  })
 
   // Error toasts clear themselves.
   const errorText = useStore((s) => s.errorText)
@@ -1307,9 +1340,9 @@ export default function App() {
     runThickness,
   })
 
-  const dragging = useDragDrop({ openFile, openNominal, openImage, openProject })
+  const dragging = useDragDrop({ openFile, openNominal: openNominalAsking, openImage: openImageAsking, openProject })
   // A file the address names — a shared link — goes the same way as a drop.
-  useOpenFromAddress({ openFile, openNominal, openImage, openProject })
+  useOpenFromAddress({ openFile, openNominal: openNominalAsking, openImage: openImageAsking, openProject })
 
   // The commands an agent runs (src/commands) work through the session, and
   // through the same handlers as the buttons for what only the browser has:
@@ -1324,20 +1357,14 @@ export default function App() {
     flat: {
       openImage,
       closeImage: () => commitImage(null),
-      detectEdges: async (sensitivity) => {
+      detectEdges: async (sensitivity, signal) => {
         const flat = useFlat.getState()
         if (flat.subject.kind !== 'image' || !flatGrayRef.current) return flat.edgeCount
-        const before = flat.edgeVersion
+        const settled = edgesSettled(flat, signal)
         // A new sensitivity detects again by itself (the effect above).
         if (sensitivity !== flat.edgeSensitivity) flat.setEdgeSensitivity(sensitivity)
         else void runEdgeDetect()
-        await new Promise<void>((resolve) => {
-          const stop = useFlat.subscribe((s) => {
-            if (s.edgeVersion === before) return
-            stop()
-            resolve()
-          })
-        })
+        await settled
         return useFlat.getState().edgeCount
       },
       edgeIndex: () => activeEdgeIndex(),
@@ -1412,12 +1439,12 @@ export default function App() {
   const fileName = useStore((s) => s.fileName)
   const vertexCountLoaded = useStore((s) => s.vertexCount > 0)
   const draftMode = draft ? creationMethod(draft.kind, draft.method).mode : null
-  const openSlotHint = openSlotHintOf({ draft, draftMode, sectionDraft, alignDraft, dimDraft, elements, sections: storeSections })
+  const openSlotHint = openSlotHintOf({ draft, draftMode, sectionDraft, alignDraft, dimDraft, elements, sections: storeSections, scaleDraft })
   const markCount = useMark((s) => s.count)
   const editingDraft = draft?.editId !== undefined
-  const paintHint = paintHintOf({ draft, painting, markGesture, markCount, editingDraft })
+  const paintHint = paintHintOf({ draft, painting, markGesture, markStraight, markCount, editingDraft })
   const stageHint = stageHintOf({ draft, draftMode, openSlotHint, painting, paintHint, editingDraft })
-  const markHint = markHintOf({ marking, markGesture, markCount, source: useDeviation.getState().source })
+  const markHint = markHintOf({ marking, markGesture, markStraight, markCount, source: useDeviation.getState().source })
 
   // The guided hints: which control is ringing is the control's own business
   // (usePulse), but the sentence that goes with it belongs on the stage, and
@@ -1430,9 +1457,7 @@ export default function App() {
   const targetId = useDeviation((s) => s.targetId)
   // Whichever map this workspace is reading — the legend, the hover readout and
   // the pins all follow the source rather than whichever was measured last.
-  const mapReady = useDeviation((s) =>
-    s.source === 'element' ? s.elementStatus === 'ready' : s.mapStatus === 'ready',
-  )
+  const mapReady = useDeviation(mapHeld)
   const showHistogram = useDeviation((s) => s.showHistogram)
   const stats = useDeviation((s) => s.stats)
   const histogram = useDeviation((s) => s.histogram)
@@ -1445,6 +1470,11 @@ export default function App() {
   const onDeviation = workspace === 'deviation'
   const onThickness = workspace === 'thickness'
   const onFlat = workspace === 'flat'
+  // Opened once, kept from then on (hidden and paused while another workspace
+  // is up): every new WebGL canvas is a new context, and the tab is one people
+  // switch back and forth with. See the mounts below.
+  const [flatEverOpened, setFlatEverOpened] = useState(false)
+  if (onFlat && !flatEverOpened) setFlatEverOpened(true)
   const flatImageName = useFlat((s) => s.imageName)
   const flatCalSource = useFlat((s) => s.calSource)
 
@@ -1509,6 +1539,20 @@ export default function App() {
   // A plugin's workspace may put a view of its own beside the viewport.
   const pluginSplit = !picking && active?.split ? active.split : null
   const anySplit = splitOpen || pluginSplit !== null
+  // The reference half is kept once the split view has been opened, for as long
+  // as the reference it was built from is the one loaded: another reference, or
+  // none, lets it go (its context with it) the moment that is seen here, and the
+  // next opening builds a new one. A new scan is not in the question: the half
+  // borrows nothing of the scan but its camera, which the scene keeps, and a
+  // reference the session made from the old scan goes with it (scanImport), which
+  // lets the half go the same way.
+  const [splitSeen, setSplitSeen] = useState<BufferGeometry | null>(null)
+  // A reference let go while the split is closed is dropped from here as well,
+  // not held until the split is next opened: its arrays are tens of MB.
+  if (splitSeen !== nominalGeometry && (splitOpen || splitSeen !== null)) {
+    setSplitSeen(splitOpen ? nominalGeometry : null)
+  }
+  const splitKept = nominalGeometry !== null && splitSeen === nominalGeometry && sceneRef.current !== null
   // Stable, so the readout's subscription is not torn down every render.
   const registerHover = useRef((fn: ((r: HoverReading | null) => void) | null) => {
     hoverSink.current = fn
@@ -1528,7 +1572,7 @@ export default function App() {
             what: 'The nominal CAD part — mesh or STEP',
             name: nominalName,
             accept: REFERENCE_ACCEPT,
-            onOpen: (f) => void openNominal(f),
+            onOpen: (f) => void openNominalAsking(f),
           },
         ]
       : [scanSlot]
@@ -1538,6 +1582,10 @@ export default function App() {
   // over the thing the user came to see, and whatever else the workspace still
   // needs has its own row in the panel to say so.
   const needsModels = !fileName
+  const openSample = () =>
+    fetchSampleScan()
+      .then(openFile)
+      .catch((e: unknown) => useStore.setState({ errorText: e instanceof Error ? e.message : String(e) }))
 
   return (
     <div className="app">
@@ -1547,7 +1595,7 @@ export default function App() {
         onSaveProject={saveProject}
         onOpenProject={openProject}
         onOpenScan={openFile}
-        onOpenImage={openImage}
+        onOpenImage={openImageAsking}
         savable={(fileName !== null && vertexCountLoaded) || flatImageName !== null || runtimes.some((r) => r.canSave)}
       />
       <RecoveryBar recovery={recovery} />
@@ -1556,7 +1604,7 @@ export default function App() {
         {onDeviation ? (
           <DeviationPanel
             onOpenScan={(f) => void openFile(f)}
-            onOpenNominal={(f) => void openNominal(f)}
+            onOpenNominal={(f) => void openNominalAsking(f)}
             onAlign={() => void runAlign(false)}
             onStopAlign={abortAlign}
             onPickPoints={startPicking}
@@ -1587,7 +1635,7 @@ export default function App() {
           active.panel
         ) : onFlat ? (
           <FlatPanel
-            onOpenImage={(f) => void openImage(f)}
+            onOpenImage={(f) => void openImageAsking(f)}
             onCopy={handleFlatCopyReport}
             onExportCsv={handleFlatExportCsv}
             onExportSvg={handleFlatExportSvg}
@@ -1620,6 +1668,8 @@ export default function App() {
             onApplyAlignment={(m) => void handleApplyAlignment(m)}
             onApplyManual={(m) => void handleApplyManual(m)}
             onResetAlignment={() => void handleResetAlignment()}
+            scaleRefusal={() => session.scale.refusal()}
+            onApplyScale={(factor, references) => void session.scale.applyScale(factor, references)}
             onExportStep={handleExportStep}
             onExportMesh={handleExportMesh}
             onExportCloud={handleExportCloud}
@@ -1637,9 +1687,17 @@ export default function App() {
               onReady={(s) => {
                 sceneRef.current = s
                 attachSurfaceScene(() => sceneRef.current)
+                // A part's closed shells are searched in the worker as it
+                // loads, not on the main thread at the first cut.
+                s.closedShellsFrom = (which) => clientRef.current!.closedShells(which)
+                // And the scan's bounds tree, the longest single task in
+                // opening it.
+                s.boundsTreeFrom = (positions, indices) => clientRef.current!.boundsTree(positions, indices)
                 s.setNavScheme(schemeById(useStore.getState().navScheme))
+                s.setProjection(useStore.getState().projection)
                 s.setViewTheme(sceneTheme(useStore.getState().viewTheme, usePrefs.getState().dark))
                 s.setSectionLineWidth(usePrefs.getState().sectionLines)
+                s.setMarkSize(usePrefs.getState().markSize)
               }}
               onPick={handlePick}
               onHover={handleHover}
@@ -1648,29 +1706,54 @@ export default function App() {
               onPaintChange={handlePaintChange}
               onExtendDrag={handleExtendDrag}
             />
+            {/* After the viewport, so the scene exists when its effects first run. */}
+            <SceneSync
+              sceneRef={sceneRef}
+              clientRef={clientRef}
+              deviation={deviation}
+              deviationRgb={deviationRgb}
+              referenceMap={maps.referenceMap}
+              referenceRgb={maps.referenceRgb}
+              elementField={elementField}
+              elementRgb={elementRgb}
+              elementScope={elementScope}
+              fieldDirections={fieldDirections}
+              thickness={thickness}
+              thicknessRgb={thicknessRgb}
+              thickScale={thickScale}
+              plugin={active}
+              cancelDraft={handleCancelDraft}
+            />
             {!splitOpen && pluginSplit}
             {splitOpen && (
-              <>
-                <div className="splitcap">
-                  <b>Scan</b>
-                  <span>{fileName}</span>
-                </div>
-                <CompareView
-                  scene={sceneRef.current!}
-                  geometry={nominalGeometry!}
-                  role="Reference"
-                  name={nominalName ?? 'reference'}
-                />
-              </>
+              <div className="splitcap">
+                <b>Scan</b>
+                <span>{fileName}</span>
+              </div>
+            )}
+            {/* Kept after its first opening — see splitKept. A hidden half costs
+                its context and the reference's vertex buffers, once, where
+                building it anew at every opening cost both each time. */}
+            {splitKept && (
+              <CompareView
+                scene={sceneRef.current!}
+                geometry={nominalGeometry!}
+                role="Reference"
+                name={nominalName ?? 'reference'}
+                active={splitOpen}
+              />
             )}
           </div>
-          {/* The flat viewport mounts with its workspace — there is no BVH to
-              protect here, and a hidden second WebGL canvas would still hold
-              its context. The 3D viewport above merely hides. */}
-          {onFlat && (
-            <div className="viewslot">
+          {/* The flat viewport comes with its workspace's first opening and is
+              kept: it holds a context, but a new one at every switch of tab
+              costs more than this one idles at, since it draws nothing and
+              reads no layout while hidden. */}
+          {flatEverOpened && (
+            <div className="viewslot" hidden={!onFlat}>
               <FlatViewer
+                active={onFlat}
                 onReady={flatSync.onReady}
+                onResync={flatSync.resync}
                 onPick={(p, meta) => useFlat.getState().stageClick(p, meta, activeEdgeIndex())}
                 onPickDrag={(i, p, meta) =>
                   useFlat.getState().stageDrag(i, p, meta, activeEdgeIndex())
@@ -1749,7 +1832,7 @@ export default function App() {
                   what: 'The flatbed scan of the part',
                   name: flatImageName,
                   accept: IMAGE_ACCEPT,
-                  onOpen: (f) => void openImage(f),
+                  onOpen: (f) => void openImageAsking(f),
                 },
               ]}
             />
@@ -1780,6 +1863,7 @@ export default function App() {
                       : 'Load a scan, then pick features on it to fit spheres, cylinders and planes and measure between them. STL, PLY, OBJ, 3MF or STEP, in millimetres — everything stays in this browser.'
               }
               slots={startSlots}
+              onOpenSample={openSample}
             />
           )}
           {(onDeviation || onThickness || Boolean(active?.hoverReadout)) && !picking && <HoverReadout register={registerHover} />}
@@ -1838,6 +1922,13 @@ export default function App() {
           {markHint && !picking && (
             <div className="hintchip" data-test="mark-chip">
               {markHint}
+            </div>
+          )}
+          {/* What another workspace's plugin has to say about this one — see
+              PluginRuntime.elsewhere. */}
+          {!picking && runtimes.some((r, i) => i !== activeIndex && r.elsewhere) && (
+            <div className="stagenotes">
+              {runtimes.map((r, i) => (i !== activeIndex && r.elsewhere ? <div key={plugins()[i].id}>{r.elsewhere}</div> : null))}
             </div>
           )}
           <BusyOverlay />

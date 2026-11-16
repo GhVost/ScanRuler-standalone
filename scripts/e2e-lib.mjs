@@ -21,6 +21,11 @@ export const CHROME = process.env.CHROME ?? (
       '/usr/bin/google-chrome'
 )
 
+/** The modifier that adds to a selection and carries the editor's shortcuts,
+ *  named the way this platform's Chrome wants it pressed: Command on a Mac,
+ *  where Ctrl+click is the system's right-click and never reaches a pick. */
+export const MOD = process.platform === 'darwin' ? 'Meta' : 'Control'
+
 /** A file at the repo root, e.g. the default STL fixtures. */
 export const repoFile = (name) => fileURLToPath(new URL(`../${name}`, import.meta.url))
 
@@ -102,6 +107,10 @@ export async function launchApp({ width = 1500, height = 950, protocolTimeout, u
     // The big support card would take the next click after any export.
     // e2e-support-ask switches it back on in Settings.
     try { localStorage.setItem('scanruler.supportask', '0') } catch { /* as above */ }
+    // And the small card in the stage's corner, off as Settings turns it
+    // off: it sits in the middle of the stage the navigation checks read
+    // for the part, and its buttons read as part.
+    try { localStorage.setItem('scanruler.supportcard', '0') } catch { /* as above */ }
   })
   // The agent connection's warning, accepted the way a person would have:
   // every pairing link would stall on it. e2e-agent-warning asks to see it.
@@ -342,15 +351,18 @@ export async function fitBall(page, rect, farEnd, want, { ready } = {}) {
   return null
 }
 
-/** A number field set the way a person sets one: clicked, its text selected
- *  and cleared — a number input ignores select() and triple-click — typed,
- *  and left; then `settle` ms for the app to take it. */
+/** A number field set the way a person sets one: clicked, cleared, typed and
+ *  left; then `settle` ms for the app to take it. Cleared through the input's
+ *  own value setter and an input event, as React hears a keystroke: a number
+ *  input ignores select() and triple-click, and MOD+A selected nothing under
+ *  headless Chrome on macOS, so the figure was typed after what was there
+ *  (9.999 then 5 gave 9.995, issue 76). */
 export const fieldSetter = (page, { settle = 300 } = {}) => async (sel, value) => {
   await page.click(sel)
-  await page.keyboard.down('Control')
-  await page.keyboard.press('KeyA')
-  await page.keyboard.up('Control')
-  await page.keyboard.press('Backspace')
+  await page.$eval(sel, (el) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, '')
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  })
   await page.type(sel, String(value))
   await page.$eval(sel, (el) => el.blur())
   await sleep(settle)

@@ -25,9 +25,12 @@ import { EDGE_LINE_DEFAULT, SHEET_LINE_DEFAULT } from './lineWidths'
 import type { ControlScheme } from './navSchemes'
 import { OrthoViewport } from './orthoViewport'
 import { pinLabel } from './overlays'
+import { modHeld } from '../ui/platform'
 import type { ViewTheme } from './viewThemes'
 import { LineWidthRegistry } from './lineWidthRegistry'
 import { labelSpot } from '../core/flat/drawing'
+import { combStrokes, curvatureNear, type CombReach, type CurvatureReading, type CurvatureRun } from '../core/flat/curvature'
+import { combFillMaterial, combSpacing } from './combLadder'
 
 /**
  * The 2D Measure workspace's viewport: the scanned sheet on the stage, face
@@ -68,6 +71,16 @@ export interface SheetBox {
   crossing: boolean
   /** Ctrl or Shift held: what the box takes joins the selection. */
   additive: boolean
+}
+
+/** The curvature comb for setCurvatureComb: the runs it is drawn along (in
+ *  document units), each set in its own colour — the edges', an element's —
+ *  how long their teeth are, and how the reading under the cursor is
+ *  written. */
+export interface SheetCombInput {
+  layers: readonly { runs: readonly CurvatureRun[]; color: string }[]
+  reach: CombReach
+  format: (reading: CurvatureReading) => string
 }
 
 /** An arrowhead of a sketch dimension, screen pixels: slim, as a drawing's. */
@@ -146,6 +159,17 @@ export class FlatScene {
   private dimStrokeCleanup: (() => void)[] = []
   private draftGroup = new THREE.Group()
   private draftCleanup: (() => void)[] = []
+  private guideGroup = new THREE.Group()
+  private guideCleanup: (() => void)[] = []
+  /** The curvature comb — see setCurvatureComb: what it is drawn from, the
+   *  tooth spacing it was last drawn at (a rung of a ladder the zoom walks),
+   *  and the reading under the cursor. */
+  private combGroup = new THREE.Group()
+  private combCleanup: (() => void)[] = []
+  private comb: SheetCombInput | null = null
+  private combSpacingDrawn = 0
+  private combHoverGroup = new THREE.Group()
+  private combHoverCleanup: (() => void)[] = []
   /** Fitted geometry and callouts draw as screen-space fat lines (a WebGL
    *  LineBasicMaterial is one pixel whatever it asks for). Every such
    *  material needs the canvas size; this is the one copy they all read.
@@ -273,7 +297,7 @@ export class FlatScene {
           this.onPick?.(p, {
             alt: e?.altKey ?? false,
             shift: e?.shiftKey ?? false,
-            ctrl: e?.ctrlKey ?? false,
+            ctrl: modHeld(e),
             unitsPerScreenPx: this.unitsPerScreenPx(),
           })
         }
@@ -292,11 +316,12 @@ export class FlatScene {
           this.beginPinDrag(pin, e)
           return true
         }
-        // Ctrl is the sketch's "no snapping" and has to be able to start a
-        // drag; Shift and Meta are left to the navigator's chords.
-        if (this.onSheetDown && !e.shiftKey && !e.metaKey) {
+        // Ctrl, or Command on a Mac, is the sketch's "no snapping" and has to
+        // be able to start a drag; Shift is left to the navigator's chords. No
+        // scheme binds Command, and the navigator does not read it.
+        if (this.onSheetDown && !e.shiftKey) {
           const p = this.pick(e.clientX, e.clientY)
-          if (p && this.onSheetDown(p, { alt: e.altKey, ctrl: e.ctrlKey, unitsPerScreenPx: this.unitsPerScreenPx() })) {
+          if (p && this.onSheetDown(p, { alt: e.altKey, ctrl: modHeld(e), unitsPerScreenPx: this.unitsPerScreenPx() })) {
             this.beginSheetDrag(e)
             return true
           }
@@ -307,7 +332,7 @@ export class FlatScene {
         }
         // A chord the user's scheme still gives the camera — Ctrl+left in
         // Tinkercad's — stays the camera's.
-        if (this.boxSelect && !e.metaKey && !this.viewport.nav.navigates(e)) {
+        if (this.boxSelect && !this.viewport.nav.navigates(e)) {
           this.beginBox(e)
           return true
         }
@@ -321,10 +346,11 @@ export class FlatScene {
         // ruled over.
         if (this.gridFrame && this.gridStale()) this.rebuildGrid()
         if (this.sketchDims && Math.abs(this.unitsPerScreenPx() / this.sketchDims.px - 1) > 0.01) this.rebuildDimStrokes()
-        // Fat lines are sized in screen pixels and need to know the canvas.
-        const el = this.viewport.renderer.domElement
-        const w = el.clientWidth || 1
-        const h = el.clientHeight || 1
+        if (this.comb && combSpacing(this.unitsPerScreenPx()) !== this.combSpacingDrawn) this.rebuildComb()
+        // Fat lines are sized in screen pixels and need to know the canvas:
+        // its cached size, as a read of the layout every frame is a forced
+        // layout pass after any DOM write.
+        const { w, h } = this.viewport.size
         if (this.fatLines.setResolution(w, h)) {
           this.edgeMaterial.resolution.copy(this.fatLines.resolution)
           this.viewport.invalidate()
@@ -341,6 +367,7 @@ export class FlatScene {
       },
     })
     this.container.addEventListener('pointermove', this.hoverMove)
+    this.container.addEventListener('pointerleave', this.hoverLeave)
     this.viewport.nav.setPlanar(true)
 
     // Unlit: the scan is a document, not a body — the lights must not shade it.
@@ -353,12 +380,55 @@ export class FlatScene {
     this.viewport.scene.add(this.countGroup)
     this.viewport.scene.add(this.noteGroup)
     this.viewport.scene.add(this.edgeGroup)
+    this.viewport.scene.add(this.combGroup)
+    this.viewport.scene.add(this.combHoverGroup)
     this.viewport.scene.add(this.fillGroup)
     this.viewport.scene.add(this.elementGroup)
     this.viewport.scene.add(this.dotGroup)
     this.viewport.scene.add(this.dimensionGroup)
     this.viewport.scene.add(this.dimStrokeGroup)
     this.viewport.scene.add(this.draftGroup)
+    this.viewport.scene.add(this.guideGroup)
+  }
+
+  /** Guide lines a tool draws over the sheet while the cursor moves, each in
+   *  its own colour: a sketch's dashed tracking lines from a point it can be
+   *  placed level with, the stretch a trim would take, lit. Dashes are
+   *  sized in screen pixels at the zoom they are drawn at — the caller draws
+   *  them again as the cursor moves. Empty clears them. */
+  setGuides(guides: readonly { points: readonly Vec2[]; color: string; dashed?: boolean; width?: number }[]): void {
+    for (const dispose of this.guideCleanup) dispose()
+    this.guideCleanup = []
+    this.guideGroup.clear()
+    const px = this.unitsPerScreenPx()
+    for (const g of guides) {
+      if (g.points.length < 2) continue
+      const width = g.width ?? 1.5
+      const mat = new LineMaterial({
+        color: new THREE.Color(g.color).getHex(),
+        linewidth: width * this.fatLines.scale,
+        transparent: true,
+        opacity: 0.95,
+        depthTest: false,
+        worldUnits: false,
+        dashed: Boolean(g.dashed),
+        dashSize: 6 * px,
+        gapSize: 4 * px,
+      })
+      const letGo = this.fatLines.track(mat, width)
+      const geo = new LineGeometry()
+      geo.setPositions(g.points.flatMap((p) => [p[0], p[1], 0.22]))
+      const line = new Line2(geo, mat)
+      line.computeLineDistances()
+      line.renderOrder = 5
+      this.guideGroup.add(line)
+      this.guideCleanup.push(() => {
+        letGo()
+        mat.dispose()
+        geo.dispose()
+      })
+    }
+    this.viewport.invalidate()
   }
 
   /** The measured dimensions on the sheet: a callout line with its value for
@@ -810,7 +880,7 @@ export class FlatScene {
       if (!p) return
       if (!d.moved) this.container.style.cursor = 'grabbing'
       d.moved = true
-      this.onSheetDrag?.(p, { alt: ev.altKey, ctrl: ev.ctrlKey, unitsPerScreenPx: this.unitsPerScreenPx() })
+      this.onSheetDrag?.(p, { alt: ev.altKey, ctrl: modHeld(ev), unitsPerScreenPx: this.unitsPerScreenPx() })
     }
     const up = (ev: PointerEvent) => {
       document.removeEventListener('pointermove', move)
@@ -819,7 +889,7 @@ export class FlatScene {
       const d = this.sheetDragging
       this.sheetDragging = null
       this.container.style.cursor = this.pinHover || this.dragHover ? 'grab' : this.baseCursor
-      const meta = { alt: ev.altKey, shift: ev.shiftKey, ctrl: ev.ctrlKey, unitsPerScreenPx: this.unitsPerScreenPx() }
+      const meta = { alt: ev.altKey, shift: ev.shiftKey, ctrl: modHeld(ev), unitsPerScreenPx: this.unitsPerScreenPx() }
       if (d?.moved) this.onSheetDragEnd?.(meta)
       else {
         const p = this.pick(start.x, start.y)
@@ -840,9 +910,155 @@ export class FlatScene {
           (this.pinAt(e.clientX, e.clientY) >= 0 || this.handleAt(e.clientX, e.clientY) !== null),
       )
     }
-    if (!this.onHoverPoint) return
+    if (!this.onHoverPoint && !this.comb) return
     const p = this.sheet.visible ? this.pick(e.clientX, e.clientY) : null
-    this.onHoverPoint(p, e.clientX, e.clientY, e.altKey, e.ctrlKey)
+    if (this.comb) this.showCombReading(p)
+    this.onHoverPoint?.(p, e.clientX, e.clientY, e.altKey, modHeld(e))
+  }
+
+  private hoverLeave = (): void => {
+    if (this.comb) this.showCombReading(null)
+  }
+
+  /**
+   * The curvature comb over the sheet: a tooth square to each curve every
+   * so many screen pixels, as long as the curve is curved there, and a line
+   * through the tips, the area between filled faintly — the teeth cut short
+   * at the reach's cap a shade fainter. The teeth are spaced on a ladder the zoom walks, so zooming in
+   * shows more of them rather than spreading them out. With the cursor near
+   * a curve the reading there is pinned to it — what `format` makes of it.
+   * Null takes the comb away.
+   */
+  setCurvatureComb(comb: SheetCombInput | null): void {
+    this.comb = comb && comb.layers.some((l) => l.runs.length > 0) ? comb : null
+    this.rebuildComb()
+    if (!this.comb) this.showCombReading(null)
+  }
+
+  private rebuildComb(): void {
+    for (const dispose of this.combCleanup) dispose()
+    this.combCleanup = []
+    this.combGroup.clear()
+    this.viewport.invalidate()
+    const comb = this.comb
+    if (!comb) return
+    this.combSpacingDrawn = combSpacing(this.unitsPerScreenPx())
+    for (const layer of comb.layers) {
+      const strokes = combStrokes(layer.runs, comb.reach, this.combSpacingDrawn)
+      const color = new THREE.Color(layer.color).getHex()
+      if (strokes.fill.length > 0) {
+        const positions = new Float32Array((strokes.fill.length / 2) * 3)
+        for (let i = 0, j = 0; i < strokes.fill.length; i += 2, j += 3) {
+          positions[j] = strokes.fill[i]
+          positions[j + 1] = strokes.fill[i + 1]
+          positions[j + 2] = 0.11
+        }
+        const geo = new THREE.BufferGeometry()
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+        const mat = combFillMaterial(color)
+        const mesh = new THREE.Mesh(geo, mat)
+        mesh.renderOrder = 3
+        this.combGroup.add(mesh)
+        this.combCleanup.push(() => {
+          mat.dispose()
+          geo.dispose()
+        })
+      }
+      const segments = (pts: Float32Array, opacity: number, width: number) => {
+        if (pts.length === 0) return
+        const positions = new Float32Array((pts.length / 2) * 3)
+        for (let i = 0, j = 0; i < pts.length; i += 2, j += 3) {
+          positions[j] = pts[i]
+          positions[j + 1] = pts[i + 1]
+          positions[j + 2] = 0.12
+        }
+        const geo = new LineSegmentsGeometry()
+        geo.setPositions(positions)
+        const mat = this.combMaterial(color, opacity, width)
+        const lines = new LineSegments2(geo, mat.mat)
+        lines.renderOrder = 3
+        this.combGroup.add(lines)
+        this.combCleanup.push(() => {
+          mat.letGo()
+          geo.dispose()
+        })
+      }
+      segments(strokes.teeth, 0.55, 1)
+      segments(strokes.capped, 0.22, 1)
+      for (const env of strokes.envelopes) {
+        const positions: number[] = []
+        for (let i = 0; i < env.length; i += 2) positions.push(env[i], env[i + 1], 0.13)
+        const geo = new LineGeometry()
+        geo.setPositions(positions)
+        const mat = this.combMaterial(color, 0.95, 1.5)
+        const line = new Line2(geo, mat.mat)
+        line.renderOrder = 3
+        this.combGroup.add(line)
+        this.combCleanup.push(() => {
+          mat.letGo()
+          geo.dispose()
+        })
+      }
+    }
+  }
+
+  private combMaterial(color: number, opacity: number, width: number): { mat: LineMaterial; letGo: () => void } {
+    const mat = new LineMaterial({
+      color,
+      linewidth: width * this.fatLines.scale,
+      transparent: true,
+      opacity,
+      depthTest: false,
+      worldUnits: false,
+    })
+    const release = this.fatLines.track(mat, width)
+    return {
+      mat,
+      letGo: () => {
+        release()
+        mat.dispose()
+      },
+    }
+  }
+
+  /** Pin the comb's reading nearest `p` — within a hand's reach on screen —
+   *  to the curve, or take it away. */
+  private showCombReading(p: Vec2 | null): void {
+    const comb = this.comb
+    let reading: CurvatureReading | null = null
+    let color = ''
+    if (comb && p) {
+      let reach = 10 * this.unitsPerScreenPx()
+      for (const layer of comb.layers) {
+        const r = curvatureNear(layer.runs, p, reach)
+        if (!r) continue
+        reading = r
+        color = layer.color
+        reach = r.distance
+      }
+    }
+    for (const dispose of this.combHoverCleanup) dispose()
+    this.combHoverCleanup = []
+    this.combHoverGroup.clear()
+    this.viewport.invalidate()
+    if (!comb || !reading) return
+    const label = pinLabel('element-label comb-label', 'Curvature', comb.format(reading), color)
+    label.position.set(reading.at[0], reading.at[1], 0.25)
+    label.center.set(0, 1.4)
+    this.combHoverGroup.add(label)
+    this.combHoverCleanup.push(() => label.element.remove())
+    const geo = new THREE.CircleGeometry(1, 20)
+    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color), depthTest: false })
+    const dot = new THREE.Mesh(geo, mat)
+    const r = 3.5 * this.unitsPerScreenPx()
+    dot.scale.set(r, r, 1)
+    dot.position.set(reading.at[0], reading.at[1], 0.25)
+    dot.renderOrder = 6
+    this.combHoverGroup.add(dot)
+    this.combHoverCleanup.push(() => {
+      geo.dispose()
+      mat.dispose()
+    })
   }
 
   /** Document spots on screen, in client pixels — for hit-testing the marks
@@ -968,13 +1184,24 @@ export class FlatScene {
     this.container.appendChild(div)
     this.bandDiv = div
     const move = (ev: PointerEvent) => this.layoutBand(ev.clientX, ev.clientY)
-    const up = (ev: PointerEvent) => {
+    const stop = () => {
       document.removeEventListener('pointermove', move)
       document.removeEventListener('pointerup', up)
+      document.removeEventListener('pointercancel', cancel)
+    }
+    const up = (ev: PointerEvent) => {
+      stop()
       this.finishBand(ev.clientX, ev.clientY, ev)
+    }
+    // A gesture the browser takes over selects nothing: left listening, the
+    // band would box-select at whatever release came next, anywhere.
+    const cancel = () => {
+      stop()
+      this.dropBand()
     }
     document.addEventListener('pointermove', move)
     document.addEventListener('pointerup', up)
+    document.addEventListener('pointercancel', cancel)
     this.layoutBand(e.clientX, e.clientY)
   }
 
@@ -1018,9 +1245,12 @@ export class FlatScene {
 
   /** Draw a selection box from the press: rightward a window, drawn solid,
    *  leftward a crossing box, drawn dashed — read again at every move, so
-   *  the box changes as the hand crosses back over where it started. Only
-   *  the pointer that pressed moves it; a release within the click
-   *  threshold is a click. */
+   *  the box changes as the hand crosses back over where it started. With
+   *  Ctrl, Command or Shift held it adds to the selection, and says so with
+   *  a + and a heavier border, as the key goes down or up too: the colour
+   *  tells the box's direction, not the key (issue 62). Only the pointer
+   *  that pressed moves it; a release within the click threshold is a
+   *  click. */
   private beginBox(e: PointerEvent): void {
     this.dropBox()
     const id = e.pointerId
@@ -1036,6 +1266,7 @@ export class FlatScene {
       const box = this.sheetBox(start, ev)
       div.classList.toggle('window', !box?.crossing)
       div.classList.toggle('crossing', !!box?.crossing)
+      div.classList.toggle('additive', !!box?.additive)
       this.layoutBox(div, start, ev.clientX, ev.clientY)
       if (box) this.onBoxDrag?.(box)
     }
@@ -1047,20 +1278,26 @@ export class FlatScene {
       else if (!moved) {
         // The navigator never saw the press, so the click is said from here.
         const p = this.pick(start.x, start.y)
-        if (p) this.onPick?.(p, { alt: ev.altKey, shift: ev.shiftKey, ctrl: ev.ctrlKey, unitsPerScreenPx: this.unitsPerScreenPx() })
+        if (p) this.onPick?.(p, { alt: ev.altKey, shift: ev.shiftKey, ctrl: modHeld(ev), unitsPerScreenPx: this.unitsPerScreenPx() })
       }
     }
     const cancel = (ev: PointerEvent) => {
       if (ev.pointerId === id) this.dropBox()
     }
+    // The key pressed or let go with the hand still: the mark follows it.
+    const key = (ev: KeyboardEvent) => div.classList.toggle('additive', modHeld(ev) || ev.shiftKey)
     document.addEventListener('pointermove', move)
     document.addEventListener('pointerup', up)
     document.addEventListener('pointercancel', cancel)
+    window.addEventListener('keydown', key)
+    window.addEventListener('keyup', key)
     this.box = {
       end: () => {
         document.removeEventListener('pointermove', move)
         document.removeEventListener('pointerup', up)
         document.removeEventListener('pointercancel', cancel)
+        window.removeEventListener('keydown', key)
+        window.removeEventListener('keyup', key)
         div.remove()
         if (moved) this.onBoxDrag?.(null)
       },
@@ -1078,7 +1315,7 @@ export class FlatScene {
       this.planeAt(start.x, e.clientY),
     ]
     if (corners.some((c) => c === null)) return null
-    return { corners: corners as SheetBox['corners'], crossing: e.clientX < start.x, additive: e.ctrlKey || e.shiftKey }
+    return { corners: corners as SheetBox['corners'], crossing: e.clientX < start.x, additive: modHeld(e) || e.shiftKey }
   }
 
   private layoutBox(div: HTMLDivElement, start: { x: number; y: number }, x: number, y: number): void {
@@ -1107,9 +1344,7 @@ export class FlatScene {
   /** Document units per screen pixel at the current zoom — what turns a snap
    *  radius the hand understands into one the sheet understands. */
   unitsPerScreenPx(): number {
-    const cam = this.viewport.camera
-    const h = this.viewport.renderer.domElement.clientHeight || 1
-    return (cam.top - cam.bottom) / cam.zoom / h
+    return this.viewport.worldPerPixel()
   }
 
   /** The polyline a fit draws as: a segment, a full circle, an arc. A point
@@ -1883,8 +2118,18 @@ export class FlatScene {
     this.viewport.invalidate()
   }
 
+  /** Held back while the sheet is not on screen: no frame is drawn and no
+   *  layout is read. What the stores pushed in the meantime is on the sheet
+   *  already and is drawn on the first frame after it comes back. */
+  setPaused(paused: boolean): void {
+    this.viewport.paused = paused
+    if (!paused) this.viewport.resize()
+  }
+
   dispose(): void {
     this.container.removeEventListener('pointermove', this.hoverMove)
+    this.container.removeEventListener('pointerleave', this.hoverLeave)
+    this.setCurvatureComb(null)
     this.container.style.cursor = ''
     this.dropBand()
     this.setGrid(null)
@@ -1897,6 +2142,7 @@ export class FlatScene {
     this.setFlatElements([])
     this.setFlatDimensions([])
     this.setDraftMarks([], null)
+    this.setGuides([])
     this.setEdgeChains(null)
     this.dropBox()
     this.edgeMaterial.dispose()

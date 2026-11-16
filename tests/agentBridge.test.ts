@@ -4,10 +4,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { serverTooOld, takePairingLink, useAgentLink, WANTS_SERVER } from '../src/commands/agentLink'
 import { registerGuide } from '../src/commands/guides'
-import { runCommand } from '../src/commands/registry'
+import { registerCommands, runCommand } from '../src/commands/registry'
 import { isStaleImport, resetPageStale } from '../src/commands/stalePage'
 import { CommandError } from '../src/commands/types'
-import { startBridge } from '../src/commands/bridge'
+import { BROWSER_ASKING, nothingAnswers, startBridge } from '../src/commands/bridge'
 import { decoder, encode, type Message } from '../src/commands/framing'
 import { usePrefs } from '../src/state/prefsStore'
 import { boxMesh } from './helpers'
@@ -55,6 +55,13 @@ class FakeSocket {
 
 /** The page's answer to request `id` — not its progress lines. */
 const answerTo = (socket: FakeSocket, id: number) => socket.messages().find((m) => m.id === id && ('result' in m || 'error' in m))
+
+it('refuses binary paths that can change object prototypes', () => {
+  const read = decoder(() => {})
+  expect(() => read(JSON.stringify({ binary: '__proto__.polluted' }))).toThrow(/unsafe binary path/i)
+  expect(() => read(JSON.stringify({ binary: 'constructor.prototype.polluted' }))).toThrow(/unsafe binary path/i)
+  expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined()
+})
 
 const until = async <T>(read: () => T | undefined | null | false, what: string): Promise<T> => {
   for (let i = 0; i < 400; i++) {
@@ -221,6 +228,34 @@ describe('the agent bridge', () => {
     expect(useAgentLink.getState().status).toBe('waiting')
   })
 
+  it('says nothing answers on the port while the hello fails, and how to start it', async () => {
+    stop = startBridge({ port: 7400, token: 't', socket: (url) => new FakeSocket(url) as unknown as WebSocket, reach: async () => false })
+    await until(() => useAgentLink.getState().detail, 'the reason')
+    expect(useAgentLink.getState()).toMatchObject({ status: 'waiting', detail: nothingAnswers(7400) })
+    expect(nothingAnswers(7400)).toContain('port 7400')
+    expect(nothingAnswers(7400)).toContain('--pair')
+    expect(nothingAnswers(7400)).toContain('--serve')
+  })
+
+  it('says it waits for the browser while the hello hangs, and stops saying so once it answers (issue 100)', async () => {
+    let answer: ((ok: boolean) => void) | undefined
+    stop = startBridge({
+      port: 7400,
+      token: 't',
+      socket: (url) => new FakeSocket(url) as unknown as WebSocket,
+      reach: () => new Promise((resolve) => (answer = resolve)),
+      slowMs: 20,
+    })
+    await until(() => useAgentLink.getState().detail === BROWSER_ASKING, 'the browser question')
+    expect(useAgentLink.getState().status).toBe('waiting')
+    answer!(true)
+    const socket = await until(() => FakeSocket.made[0], 'the socket')
+    expect(useAgentLink.getState().detail).toBeNull()
+    socket.open()
+    socket.say({ welcome: { server: 'scanruler-mcp', version: '1.0.0' } })
+    expect(useAgentLink.getState()).toMatchObject({ status: 'connected', detail: null })
+  })
+
   it('takes a pairing link out of the address into the settings', () => {
     const replaced: string[] = []
     vi.stubGlobal('location', { hash: '#agent=7400:abcdEFGH_1234-xyz', pathname: '/', search: '?plugins=none' })
@@ -255,5 +290,24 @@ describe('the agent bridge', () => {
     expect(usePrefs.getState()).toMatchObject({ agentLink: false, agentDataOk: true })
     usePrefs.getState().setAgentLink(true)
     expect(usePrefs.getState()).toMatchObject({ agentLink: true, agentDataAsking: false })
+  })
+  it('answers a command on the connection it came on, not on the one after', async () => {
+    let finish!: () => void
+    registerCommands('test', [{
+      name: 'wait', title: 'Wait', description: 'Waits to be let go.', input: { type: 'object', properties: {} }, readOnly: true,
+      run: () => new Promise((resolve) => (finish = () => resolve({ done: true }))),
+    } as never])
+    const first = await connect()
+    first.say({ welcome: { server: 'scanruler-mcp', version: '0.5.0' } })
+    first.say({ id: 3, method: 'run', name: 'test.wait', input: {} })
+    await until(() => finish, 'the command to start')
+    // The server stops; a new one — counting its ids from 1 again — takes the port.
+    first.close(1006)
+    const second = await until(() => FakeSocket.made[1], 'the page to reconnect')
+    second.open()
+    second.say({ welcome: { server: 'scanruler-mcp', version: '0.5.0' } })
+    finish()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(answerTo(second, 3)).toBeUndefined()
   })
 })

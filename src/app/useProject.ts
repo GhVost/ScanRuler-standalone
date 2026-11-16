@@ -16,7 +16,7 @@ import { useThickness } from '../state/thicknessStore'
 import { useFlat } from '../state/flatStore'
 import { forgetKeptParts, keepUnownedParts, projectSections } from './projectSections'
 import { ProjectClient } from '../core/project/projectClient'
-import { PROJECT_EXTENSION, projectStem, rigidFromJson } from '../core/project/manifest'
+import { isProjectName, PROJECT_EXTENSION, projectStem, rigidFromJson, startsAsProject } from '../core/project/manifest'
 import { saveFile } from './exports'
 import {
   blankManifest,
@@ -34,8 +34,29 @@ import type { ImportQueue } from './importQueue'
 import { prepareScan, prepareNominal, prepareImage, runImport, type PreparedScan, type PreparedNominal, type PreparedImage } from './imports'
 import { bundleFiles } from './scanFiles'
 
-export const isProjectFile = (name: string) =>
-  name.toLowerCase().endsWith(`.${PROJECT_EXTENSION}`)
+/** A project by its name: `.scanruler`, or that with a count a browser
+ *  put after it (isProjectName). */
+export const isProjectFile = (name: string) => isProjectName(name)
+
+/** A project by what it holds, for a file whose name says nothing a project
+ *  or a model would: a renamed or oddly saved project still opens. */
+export const holdsProject = async (file: File): Promise<boolean> => {
+  try {
+    return startsAsProject(new Uint8Array(await file.slice(0, 64).arrayBuffer()))
+  } catch {
+    return false
+  }
+}
+
+/** The status line's word on the elements whose surface was not found
+ *  again on opening — their saved fits stand; empty when there are none. */
+export function lostSurfaces(lost: readonly { name: string; failed: string | null }[]): string {
+  if (lost.length === 0) return ''
+  const names = lost.map((j) => j.name)
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+  const one = lost.length === 1
+  return ` The surface${one ? '' : 's'} of ${list} could not be found again — ${one ? 'its saved fit stands' : 'their saved fits stand'} (${lost[0].failed}).`
+}
 
 export function useProject({
   sources,
@@ -60,7 +81,8 @@ export function useProject({
   commitNominal: (nominal: PreparedNominal | null) => void
   commitImage: (image: PreparedImage | null) => void
   runEdgeDetect: () => Promise<void>
-  runFit: (id: number, kind: ElementKind, seeds: number[], selection?: Uint32Array, regionsOnly?: boolean) => Promise<void>
+  /** Resolves to why the fit failed, or null. */
+  runFit: (id: number, kind: ElementKind, seeds: number[], selection?: Uint32Array, regionsOnly?: boolean) => Promise<string | null>
   runDeviation: () => Promise<void>
   runThickness: () => Promise<void>
 }) {
@@ -133,7 +155,7 @@ export function useProject({
       // the worker's current scan/reference. Any member may still fail here.
       // A member saved in other units is read in millimetres from them again,
       // the way it was when it came in; the manifest checked the value.
-      if (scanFile) scan = await prepareScan(meshClient, sceneRef.current!, bundleFiles([scanFile, ...companions])!, creaseSetting(useStore.getState()), alignment ?? undefined, meshUnitsOf(manifest.scan?.units) ?? 'mm') // units-ok: the file's own units, an id
+      if (scanFile) scan = await prepareScan(meshClient, sceneRef.current!, bundleFiles([scanFile, ...companions])!, creaseSetting(useStore.getState()), alignment ?? undefined, meshUnitsOf(manifest.scan?.units) ?? 'mm', manifest.scan?.scale ?? 1) // units-ok: the file's own units, an id
       if (nominalFile) nominal = await prepareNominal(meshClient, sceneRef.current!, nominalFile, meshUnitsOf(ref?.units) ?? 'mm') // units-ok: the file's own units, an id
       if (imageFile) image = await prepareImage(imageFile)
 
@@ -158,15 +180,19 @@ export function useProject({
       for (const section of present) await section.restore?.(manifest[section.key], { manifest, members })
 
       // ---- everything measured rather than stored ----
-      const jobs: Promise<void>[] = []
+      const jobs: Promise<{ name: string; failed: string | null }>[] = []
       for (const el of useStore.getState().elements) {
         if (el.source.type !== 'fitted') continue
         // The fit as saved stands: only the surface it was measured on is
         // read again. Fitted anew it can land elsewhere, and what was built
         // on it moves with no edit (one without a saved fit is fitted).
-        jobs.push(runFit(el.id, el.kind, el.source.seeds, el.source.selection, true))
+        jobs.push(runFit(el.id, el.kind, el.source.seeds, el.source.selection, true).then((failed) => ({ name: el.name, failed })))
       }
-      await Promise.all(jobs)
+      // A surface not found again leaves its element's saved fit standing:
+      // the project is open, and the status says which. Its message is not
+      // the error of the open.
+      const lost = (await Promise.all(jobs)).filter((j) => j.failed !== null)
+      if (lost.some((j) => j.failed === useStore.getState().errorText)) useStore.setState({ errorText: null })
       if (manifest.scan && manifest.deviation.align && useDeviation.getState().nominalName) {
         await runDeviation()
       }
@@ -178,7 +204,7 @@ export function useProject({
       sceneRef.current?.frameAll()
       useStore.setState({
         busy: false,
-        statusText: `Project opened — ${file.name}.${unowned.length > 0 ? ' It also holds work this build has no workspace for; that is kept, and saved with the project.' : ''}`,
+        statusText: `Project opened — ${file.name}.${lostSurfaces(lost)}${unowned.length > 0 ? ' It also holds work this build has no workspace for; that is kept, and saved with the project.' : ''}`,
       })
       if (recovered) recovery.restored()
       else recovery.markSaved(capture())

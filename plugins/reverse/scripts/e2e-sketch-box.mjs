@@ -4,15 +4,15 @@
 // tool a left-drag over the bare sheet draws a box instead of panning —
 // dragged rightward a solid window that takes the pieces wholly inside it,
 // dragged leftward a dashed crossing box that takes what it touches, lit
-// while it is dragged; Shift adds to the selection; a click on the bare
-// sheet still clears it; a press on a piece still drags the piece; the
+// while it is dragged; Shift adds to the selection, and so does Command,
+// which also starts a drag on a piece; a click on the bare sheet still clears it; a press on a piece still drags the piece; the
 // right button still pans; and a drawing tool in hand leaves the left-drag
 // a pan.
 //
 // Prereqs: dev server running (npm run dev), Chrome installed.
 //   node plugins/reverse/scripts/e2e-sketch-box.mjs
 // Env: CHROME (chrome.exe path), APP_URL, SHOT_DIR.
-import { check, click, finish, launchApp, shotPath, sleep } from '../../../scripts/e2e-lib.mjs'
+import { check, click, finish, launchApp, MOD, shotPath, sleep } from '../../../scripts/e2e-lib.mjs'
 import { openReverse, reverseHelpers } from './lib.mjs'
 
 const { browser, page, consoleErrors } = await launchApp({ width: 1600, height: 1000, protocolTimeout: 600_000 })
@@ -61,17 +61,17 @@ const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i])
 
 /** Press at one sheet point, move to another in steps, and let go —
  *  `before` runs with the button still down, at the far end. */
-async function drag(from, to, { button = 'left', shift = false, before } = {}) {
+async function drag(from, to, { button = 'left', shift = false, key = shift ? 'Shift' : null, before } = {}) {
   const [x0, y0] = await toClient(from)
   const [x1, y1] = await toClient(to)
-  if (shift) await page.keyboard.down('Shift')
+  if (key) await page.keyboard.down(key)
   await page.mouse.move(x0, y0)
   await page.mouse.down({ button })
   for (let i = 1; i <= 8; i++) await page.mouse.move(x0 + ((x1 - x0) * i) / 8, y0 + ((y1 - y0) * i) / 8)
   await sleep(120)
   if (before) await before()
   await page.mouse.up({ button })
-  if (shift) await page.keyboard.up('Shift')
+  if (key) await page.keyboard.up(key)
   await sleep(250)
 }
 
@@ -82,12 +82,13 @@ await drag([5, 0], [55, 30], {
   before: async () => {
     band = await re(() => {
       const b = document.querySelector('[data-test=sketch-viewport] .flat-band.box')
-      return b ? { window: b.classList.contains('window'), crossing: b.classList.contains('crossing'), w: b.getBoundingClientRect().width } : null
+      return b ? { window: b.classList.contains('window'), crossing: b.classList.contains('crossing'), additive: b.classList.contains('additive'), w: b.getBoundingClientRect().width } : null
     })
     await page.screenshot({ path: shotPath('sketch-box-window.png') })
   },
 })
 check(band !== null && band.window && !band.crossing && band.w > 50, 'dragged rightward the box is a window')
+check(band !== null && !band.additive, 'with no key held it bears no + (it replaces the selection)')
 check(same(await selection(), ids.square), 'the window takes the four sides of the rectangle, not the lone line')
 check(same(await centre(), startCentre), 'the left-drag did not pan the sheet')
 check((await re(() => document.querySelector('[data-test=sketch-viewport] .flat-band'))) === null, 'the box is gone once let go')
@@ -110,9 +111,39 @@ check(band !== null && band.crossing && !band.window, 'dragged leftward the box 
 check(same(await selection(), [ids.bottom, ids.right, ids.lone].sort((a, b) => a - b)), 'the crossing box takes the bottom and right sides it touches and the lone line')
 
 // ---- Shift adds -------------------------------------------------------------------------
-await drag([5, 0], [55, 30], { shift: true })
+/** Whether the box on the stage bears the + of a box that adds. */
+const marked = () => re(() => document.querySelector('[data-test=sketch-viewport] .flat-band.box')?.classList.contains('additive') ?? null)
+let adding = null
+await drag([5, 0], [55, 30], {
+  shift: true,
+  before: async () => {
+    adding = await marked()
+    await page.screenshot({ path: shotPath('sketch-box-additive.png') })
+  },
+})
+check(adding === true, 'with Shift held the box bears a + while it is dragged (issue 62)')
 check(same(await selection(), [...ids.square, ids.lone].sort((a, b) => a - b)), 'a window with Shift held adds the rectangle to the selection')
 check(same(await centre(), startCentre), 'the Shift+drag did not pan the sheet')
+
+// ---- Command, as a Mac presses it ----------------------------------------------------------
+await drag([70, 10], [45, 0])
+adding = null
+await drag([5, 0], [55, 30], { key: 'Meta', before: async () => (adding = await marked()) })
+check(adding === true, 'and with Command held too')
+check(same(await selection(), [...ids.square, ids.lone].sort((a, b) => a - b)), 'a window with Command held adds the rectangle to the selection')
+check(same(await centre(), startCentre), 'the Command+drag did not pan the sheet')
+{
+  const before = await re((id) => window.__re.store.getState().sketchDraft.sketch.entities.find((e) => e.id === id).a[1], ids.lone)
+  await drag([70, 5], [70, 2], { key: 'Meta' })
+  const after = await re((id) => window.__re.store.getState().sketchDraft.sketch.entities.find((e) => e.id === id).a[1], ids.lone)
+  check(after < before - 1, `a press on a piece with Command held starts its drag (${before} to ${after})`)
+  check(same(await centre(), startCentre), 'and does not pan the sheet')
+  // The platform's own key: on a Mac, Control with a click is a right click.
+  await page.keyboard.down(MOD)
+  await page.keyboard.press('z')
+  await page.keyboard.up(MOD)
+  await sleep(250)
+}
 
 // ---- a click on the bare sheet clears ------------------------------------------------------
 {

@@ -1,7 +1,7 @@
 {
   "name": "scanruler",
   "private": true,
-  "version": "0.9.2",
+  "version": "0.11.2",
   "type": "module",
   "license": "AGPL-3.0-only",
   "author": "Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>",
@@ -23,6 +23,9 @@
     "e2e:ci": "node scripts/e2e-ci.mjs",
     "e2e:production": "node scripts/e2e-production.mjs",
     "e2e:smoke": "node scripts/e2e-smoke.mjs",
+    "e2e:sample": "node scripts/e2e-sample.mjs",
+    "e2e:small-feature": "node scripts/e2e-small-feature.mjs",
+    "e2e:large-text": "node scripts/e2e-large-text.mjs",
     "e2e:align": "node scripts/e2e-align.mjs",
     "e2e:auto-align": "node scripts/e2e-auto-align.mjs",
     "e2e:align-live": "node scripts/e2e-align-live.mjs",
@@ -39,6 +42,7 @@
     "e2e:units": "node scripts/e2e-units.mjs",
     "e2e:deviation": "node scripts/e2e-deviation.mjs",
     "e2e:split": "node scripts/e2e-split.mjs",
+    "e2e:sleep": "node scripts/e2e-sleep.mjs",
     "e2e:pick-fit": "node scripts/e2e-pick-fit.mjs",
     "e2e:element-deviation": "node scripts/e2e-element-deviation.mjs",
     "e2e:circle": "node scripts/e2e-circle.mjs",
@@ -74,7 +78,7 @@
     "manifold-3d": "3.2.1",
     "meshoptimizer": "1.2.0",
     "meshstep": "0.1.1",
-    "occt-wasm": "5.7.1",
+    "occt-wasm": "5.15.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "three": "^0.180.0",
@@ -90,6 +94,6 @@
     "puppeteer-core": "^25.6.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
-    "vitest": "^3.0.0"
+    "vitest": "^5.0.5"
   }
 }

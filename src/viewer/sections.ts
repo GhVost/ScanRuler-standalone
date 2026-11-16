@@ -21,6 +21,11 @@
  * planes are on offer through the part's centre, each a faint sheet in its
  * axis's colour that lights under the cursor — see setWorldPlanes.
  *
+ * With the curvature comb on, each section wears it too — the same runs the
+ * 2D sheet draws, stood up in the section's plane, the teeth spaced on the
+ * same ladder of screen pixels and drawn ahead of the depth buffer: the
+ * teeth of a hollow point into the material. Its readings are on the sheet.
+ *
  * Fat lines, sized in screen pixels: a cut is a curve lying exactly on a
  * surface, and a one-pixel line there is lost in the shading. The materials
  * need the canvas size, which the viewport reports every tick. How heavy they
@@ -32,6 +37,10 @@ import * as THREE from 'three'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js'
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js'
+import { combStrokes, type CombReach, type CurvatureRun } from '../core/flat/curvature'
+import { combFillMaterial, combSpacing } from './combLadder'
 import { WORLD_AXES, worldCutAxis, type SectionFrame, type WorldAxis } from '../core/section/frame'
 import { sectionStroke, type SectionGeometry } from '../core/section/lift'
 import { outlinePoints, shadowRegions, type ShadowShape } from '../core/section/shadow'
@@ -40,6 +49,7 @@ import type { Vec3 } from '../core/types'
 import { AXIS_COLORS } from './axisGizmo'
 import { SECTION_LINE_DEFAULT } from './lineWidths'
 import { pinLabel } from './overlays'
+import { unclip } from './clipTree'
 import { onFramePlane, planeSheet } from './frameBasis'
 import { LineWidthRegistry } from './lineWidthRegistry'
 
@@ -49,6 +59,8 @@ import { LineWidthRegistry } from './lineWidthRegistry'
  *  where a plane through the middle of a solid part would never be seen,
  *  and faint, brighter under the cursor. */
 const WORLD_PLANE_HALF = 0.2
+/** A point on a section, its radius in pixels of the canvas. */
+const POINT_DOT_PX = 4
 const WORLD_SHEET_OPACITY = 0.18
 const WORLD_SHEET_LIT_OPACITY = 0.4
 const WORLD_BORDER_OPACITY = 0.7
@@ -63,6 +75,27 @@ export interface SectionOverlayItem {
   elements: readonly SectionGeometry[]
   /** A shadow stood up through the part — drawn as a block. */
   extrude?: boolean
+  /** The curvature comb along it: runs on the sheet, in `frame`'s [u, v]. */
+  comb?: { runs: readonly CurvatureRun[]; reach: CombReach; frame: SectionFrame }
+}
+
+/** What one finished section is drawn with, kept for as long as the section is
+ *  on offer, drawn or not. A material let go takes its shader program with it
+ *  once nothing else holds that program, and the next one drawn compiles it
+ *  again in the middle of whatever tap asked for it — so a rebuild sets the
+ *  colour, width and opacity of what it finds here and makes only what is
+ *  missing. The flags that pick a program are fixed where each is made. */
+interface SectionMaterials {
+  cut?: LineMaterial
+  elements?: LineMaterial
+  combTeeth?: LineMaterial
+  combCapped?: LineMaterial
+  combEnvelope?: LineMaterial
+  dot?: THREE.MeshBasicMaterial
+  block?: THREE.MeshBasicMaterial
+  edge?: THREE.LineBasicMaterial
+  /** Lets the fat lines above go from the registry that keeps them sized. */
+  letGo: (() => void)[]
 }
 
 export interface SectionOverlayContext {
@@ -79,6 +112,12 @@ export class SectionOverlay {
   private group = new THREE.Group()
   private previewGroup = new THREE.Group()
   private cleanup: (() => void)[] = []
+  /** The materials of every finished section on offer, by its id — see
+   *  SectionMaterials. */
+  private materials = new Map<number, SectionMaterials>()
+  /** The dots of points on the sections, and what a pixel is worth. */
+  private pointDots = new Set<THREE.Mesh>()
+  private worldPerPixel = 0
   private previewCleanup: (() => void)[] = []
   private worldGroup = new THREE.Group()
   private worldPlanes: {
@@ -87,6 +126,12 @@ export class SectionOverlay {
     sheet: THREE.MeshBasicMaterial
     border: THREE.LineBasicMaterial
   }[] = []
+  /** The sections' combs, kept so a zoom onto another rung of the tooth
+   *  ladder draws them again — see setPixelScale. */
+  private combGroup = new THREE.Group()
+  private combCleanup: (() => void)[] = []
+  private combs: { id: number; color: string; comb: NonNullable<SectionOverlayItem['comb']> }[] = []
+  private combSpacingDrawn = 0
   /** The finished cuts on screen, for cutNear. */
   private cuts: { id: number; points: Float32Array }[] = []
   /** The sheets alone, for the ray test — built once with the planes. */
@@ -101,6 +146,7 @@ export class SectionOverlay {
 
   constructor(private ctx: SectionOverlayContext) {
     ctx.partGroup.add(this.group)
+    ctx.partGroup.add(this.combGroup)
     ctx.partGroup.add(this.previewGroup)
     ctx.partGroup.add(this.worldGroup)
   }
@@ -115,7 +161,23 @@ export class SectionOverlay {
    *  made, whose sheet is drawn through the part to be set up, nor the
    *  coordinate planes on offer. See SceneManager.dressClipped. */
   clipRoots(): THREE.Object3D[] {
-    return [this.group]
+    return [this.group, this.combGroup]
+  }
+
+  /** What a pixel is worth now, from the viewport, for the points drawn on the
+   *  sections: a dot held in pixels, not one sized to the whole scan. */
+  setPixelScale(worldPerPixel: number): void {
+    if (worldPerPixel === this.worldPerPixel) return
+    this.worldPerPixel = worldPerPixel
+    if (this.combs.length > 0 && combSpacing(worldPerPixel) !== this.combSpacingDrawn) this.rebuildCombs()
+    if (this.pointDots.size === 0) return
+    const r = this.pointDotRadius()
+    for (const dot of this.pointDots) dot.scale.setScalar(r)
+    this.ctx.invalidate()
+  }
+
+  private pointDotRadius(): number {
+    return Math.max(POINT_DOT_PX * (this.worldPerPixel || this.ctx.modelRadius() / 400), 1e-5)
   }
 
   /** Whether the finished sections are on screen. */
@@ -127,6 +189,7 @@ export class SectionOverlay {
    *  its own. The next setSections sets it again as the workspace has it. */
   setShown(on: boolean): void {
     this.group.visible = on
+    this.combGroup.visible = on
     this.ctx.invalidate()
   }
 
@@ -140,20 +203,35 @@ export class SectionOverlay {
   /** The finished sections, rebuilt wholesale when anything about them
    *  changes — the same policy as the element overlays. */
   setSections(items: readonly SectionOverlayItem[], visible: boolean): void {
+    // A section on offer keeps its materials, drawn or not; only one that goes
+    // from the list lets them go.
+    for (const [id, mats] of this.materials) {
+      if (items.some((item) => item.id === id)) continue
+      for (const letGo of mats.letGo) letGo()
+      for (const m of [mats.cut, mats.elements, mats.combTeeth, mats.combCapped, mats.combEnvelope, mats.dot, mats.block, mats.edge]) m?.dispose()
+      this.materials.delete(id)
+    }
     for (const fn of this.cleanup) fn()
     this.cleanup = []
     this.group.clear()
     this.group.visible = visible
     this.ctx.invalidate()
     this.cuts = visible ? items.flatMap((item) => (item.cut ? [{ id: item.id, points: item.cut.points }] : [])) : []
-    if (!visible) return
+    this.combs = visible ? items.flatMap((item) => (item.comb ? [{ id: item.id, color: item.color, comb: item.comb }] : [])) : []
+    this.combGroup.visible = visible
+    if (!visible) {
+      this.rebuildCombs()
+      return
+    }
     for (const item of items) {
+      let held = this.materials.get(item.id)
+      if (!held) this.materials.set(item.id, (held = { letGo: [] }))
       // On the surface it was cut from, and hidden with it: a section on the
       // far side of the part is read by turning the part, like its tint.
       if (item.cut)
-        this.addPolylines(this.group, this.cleanup, item.cut, item.color, 0.95, SECTION_LINE_DEFAULT, !item.cut.shadow)
-      if (item.extrude && item.cut?.shadow) this.addBlock(this.group, this.cleanup, item.cut.shadow, item.color)
-      if (item.elements.length > 0) this.addElements(this.group, this.cleanup, item.elements, item.color)
+        this.addPolylines(this.group, this.cleanup, item.cut, item.color, 0.95, SECTION_LINE_DEFAULT, !item.cut.shadow, held)
+      if (item.extrude && item.cut?.shadow) this.addBlock(this.group, this.cleanup, item.cut.shadow, item.color, held)
+      if (item.elements.length > 0) this.addElements(this.group, this.cleanup, item.elements, item.color, held)
       const label = pinLabel('element-label', item.name, '', item.color)
       const lift = this.ctx.modelRadius() * 0.02
       label.position.set(
@@ -164,6 +242,8 @@ export class SectionOverlay {
       this.group.add(label)
       this.cleanup.push(() => label.element.remove())
     }
+    // After the loop, so each comb is drawn with its section's own materials.
+    this.rebuildCombs()
   }
 
   /**
@@ -262,7 +342,13 @@ export class SectionOverlay {
   /** A shadow extruded: each outer loop with its holes as a shape on the
    *  sheet, stood up from the part's lowest point along the normal to its
    *  highest — translucent, so the part shows through it. */
-  private addBlock(group: THREE.Group, cleanup: (() => void)[], sh: ShadowShape, color: string): void {
+  private addBlock(
+    group: THREE.Group,
+    cleanup: (() => void)[],
+    sh: ShadowShape,
+    color: string,
+    held?: SectionMaterials,
+  ): void {
     const depth = sh.extent.max - sh.extent.min
     if (!(depth > 0)) return
     const step = Math.PI / 36
@@ -281,26 +367,29 @@ export class SectionOverlay {
     geo.applyMatrix4(
       new THREE.Matrix4().makeBasis(new THREE.Vector3(...basisU), new THREE.Vector3(...basisV), new THREE.Vector3(...normal)).setPosition(base),
     )
-    const mat = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.18,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    })
+    // The preview's block is made afresh each time and goes with its cleanup;
+    // a finished section's is its own for as long as it is on offer.
+    const makeBlock = () =>
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide })
+    const mat = held ? (held.block ??= makeBlock()) : makeBlock()
+    unclip(mat).color.set(color)
     const block = new THREE.Mesh(geo, mat)
     block.renderOrder = 2
     group.add(block)
     const edges = new THREE.EdgesGeometry(geo, 30)
-    const edgeMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6, depthWrite: false })
+    const makeEdge = () => new THREE.LineBasicMaterial({ transparent: true, opacity: 0.6, depthWrite: false })
+    const edgeMat = held ? (held.edge ??= makeEdge()) : makeEdge()
+    unclip(edgeMat).color.set(color)
     const outline = new THREE.LineSegments(edges, edgeMat)
     outline.renderOrder = 3
     group.add(outline)
     cleanup.push(() => {
       geo.dispose()
-      mat.dispose()
       edges.dispose()
-      edgeMat.dispose()
+      if (!held) {
+        mat.dispose()
+        edgeMat.dispose()
+      }
     })
   }
 
@@ -405,6 +494,47 @@ export class SectionOverlay {
     this.ctx.invalidate()
   }
 
+  /** A fat-line material for a section's cut or for its elements, set as
+   *  asked. A finished section's (`held`) is the one it has had since it was
+   *  first drawn, made if it has none; the preview's is made afresh and goes
+   *  with its cleanup. `offset` is the polygon offset pulling it in front of
+   *  the surface it lies on, none for 0. */
+  private fatLine(
+    cleanup: (() => void)[],
+    held: SectionMaterials | undefined,
+    slot: 'cut' | 'elements' | 'combTeeth' | 'combCapped' | 'combEnvelope',
+    color: string,
+    opacity: number,
+    width: number,
+    depthTest: boolean,
+    offset: number,
+  ): LineMaterial {
+    let mat = held?.[slot]
+    if (!mat) {
+      mat = new LineMaterial({ transparent: true, depthWrite: false, worldUnits: false })
+      const letGo = this.fatLines.track(mat, width)
+      if (held) {
+        held[slot] = mat
+        held.letGo.push(letGo)
+      } else {
+        const own = mat
+        cleanup.push(() => {
+          letGo()
+          own.dispose()
+        })
+      }
+    }
+    unclip(mat)
+    mat.color.set(new THREE.Color(color).getHex())
+    mat.linewidth = width * this.fatLines.scale
+    mat.opacity = opacity
+    mat.depthTest = depthTest
+    mat.polygonOffset = offset !== 0
+    mat.polygonOffsetFactor = offset
+    mat.polygonOffsetUnits = offset
+    return mat
+  }
+
   /** The chains of a cut as screen-space fat lines. `onSurface` hides them
    *  behind the part like anything else on it; otherwise they draw ahead of
    *  the depth buffer. */
@@ -416,28 +546,11 @@ export class SectionOverlay {
     opacity: number,
     width: number,
     onSurface: boolean,
+    held?: SectionMaterials,
   ): void {
-    const mat = new LineMaterial({
-      color: new THREE.Color(color).getHex(),
-      linewidth: width * this.fatLines.scale,
-      transparent: true,
-      opacity,
-      depthTest: onSurface,
-      depthWrite: false,
-      worldUnits: false,
-    })
     // On the surface, a hair in front of it: the curve lies exactly on the
     // triangles it was cut from and would stripe with them otherwise.
-    if (onSurface) {
-      mat.polygonOffset = true
-      mat.polygonOffsetFactor = -2
-      mat.polygonOffsetUnits = -2
-    }
-    const letGo = this.fatLines.track(mat, width)
-    cleanup.push(() => {
-      letGo()
-      mat.dispose()
-    })
+    const mat = this.fatLine(cleanup, held, 'cut', color, opacity, width, onSurface, onSurface ? -2 : 0)
     for (let c = 0; c + 1 < cut.offsets.length; c++) {
       const start = cut.offsets[c]
       const end = cut.offsets[c + 1]
@@ -452,6 +565,66 @@ export class SectionOverlay {
     }
   }
 
+  /** Every section's comb, its teeth spaced for the zoom in force. */
+  private rebuildCombs(): void {
+    for (const fn of this.combCleanup) fn()
+    this.combCleanup = []
+    this.combGroup.clear()
+    this.ctx.invalidate()
+    if (this.combs.length === 0) return
+    const spacing = combSpacing(this.worldPerPixel || this.ctx.modelRadius() / 400)
+    this.combSpacingDrawn = spacing
+    for (const { id, color, comb } of this.combs) {
+      const held = this.materials.get(id)
+      const { teeth, capped, envelopes, fill } = combStrokes(comb.runs, comb.reach, spacing)
+      const { origin: o, basisU: u, basisV: v } = comb.frame
+      const lift = (pts: Float32Array): Float32Array => {
+        const out = new Float32Array((pts.length / 2) * 3)
+        for (let i = 0, j = 0; i < pts.length; i += 2, j += 3) {
+          const a = pts[i]
+          const b = pts[i + 1]
+          out[j] = o[0] + a * u[0] + b * v[0]
+          out[j + 1] = o[1] + a * u[1] + b * v[1]
+          out[j + 2] = o[2] + a * u[2] + b * v[2]
+        }
+        return out
+      }
+      const segments = (pts: Float32Array, slot: 'combTeeth' | 'combCapped', opacity: number) => {
+        if (pts.length === 0) return
+        const geo = new LineSegmentsGeometry()
+        geo.setPositions(lift(pts))
+        const mat = this.fatLine(this.combCleanup, held, slot, color, opacity, SECTION_LINE_DEFAULT * 0.5, false, 0)
+        const lines = new LineSegments2(geo, mat)
+        lines.renderOrder = 5
+        this.combGroup.add(lines)
+        this.combCleanup.push(() => geo.dispose())
+      }
+      if (fill.length > 0) {
+        const geo = new THREE.BufferGeometry()
+        geo.setAttribute('position', new THREE.BufferAttribute(lift(fill), 3))
+        const mat = combFillMaterial(color)
+        const mesh = new THREE.Mesh(geo, mat)
+        mesh.renderOrder = 5
+        this.combGroup.add(mesh)
+        this.combCleanup.push(() => {
+          mat.dispose()
+          geo.dispose()
+        })
+      }
+      segments(teeth, 'combTeeth', 0.6)
+      segments(capped, 'combCapped', 0.25)
+      for (const env of envelopes) {
+        const geo = new LineGeometry()
+        geo.setPositions(Array.from(lift(env)))
+        const mat = this.fatLine(this.combCleanup, held, 'combEnvelope', color, 0.95, SECTION_LINE_DEFAULT * 0.75, false, 0)
+        const line = new Line2(geo, mat)
+        line.renderOrder = 5
+        this.combGroup.add(line)
+        this.combCleanup.push(() => geo.dispose())
+      }
+    }
+  }
+
   /** The sheet's elements, stood up in the section's plane: lines, circles
    *  and arcs as fat lines over the cut, points as dots the size of a picked
    *  point's marker. Drawn ahead of the cut in the same colour, on the
@@ -461,35 +634,24 @@ export class SectionOverlay {
     cleanup: (() => void)[],
     elements: readonly SectionGeometry[],
     color: string,
+    held?: SectionMaterials,
   ): void {
-    const width = SECTION_LINE_DEFAULT + 1
-    const mat = new LineMaterial({
-      color: new THREE.Color(color).getHex(),
-      linewidth: width * this.fatLines.scale,
-      transparent: true,
-      opacity: 1,
-      depthTest: true,
-      depthWrite: false,
-      worldUnits: false,
-    })
-    mat.polygonOffset = true
-    mat.polygonOffsetFactor = -3
-    mat.polygonOffsetUnits = -3
-    const letGo = this.fatLines.track(mat, width)
-    cleanup.push(() => {
-      letGo()
-      mat.dispose()
-    })
+    const mat = this.fatLine(cleanup, held, 'elements', color, 1, SECTION_LINE_DEFAULT + 1, true, -3)
     let dotMat: THREE.MeshBasicMaterial | null = null
     for (const g of elements) {
       const stroke = sectionStroke(g)
       if (!stroke) {
         // Only a point has no stroke — it is a dot where it was picked.
         if (g.kind !== 'point') continue
-        dotMat ??= new THREE.MeshBasicMaterial({ color })
+        if (!dotMat) {
+          dotMat = held ? (held.dot ??= new THREE.MeshBasicMaterial()) : new THREE.MeshBasicMaterial()
+          unclip(dotMat).color.set(color)
+        }
         const dot = new THREE.Mesh(this.unitSphere, dotMat)
         dot.position.set(g.center[0], g.center[1], g.center[2])
-        dot.scale.setScalar(Math.max(this.ctx.modelRadius() * 0.008, 1e-4))
+        this.pointDots.add(dot)
+        cleanup.push(() => this.pointDots.delete(dot))
+        dot.scale.setScalar(this.pointDotRadius())
         dot.renderOrder = 4
         group.add(dot)
         continue
@@ -502,7 +664,7 @@ export class SectionOverlay {
       group.add(line)
       cleanup.push(() => geo.dispose())
     }
-    if (dotMat) {
+    if (dotMat && !held) {
       const m = dotMat
       cleanup.push(() => m.dispose())
     }

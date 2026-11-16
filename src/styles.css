@@ -159,6 +159,11 @@ body {
   /* The window itself never scrolls, so a drag that runs past the end of a
      panel must not rubber-band the chassis under it either. */
   overscroll-behavior: none;
+  /* Figures of one width: a count, a reading or a pick tally that changes
+     does not shove the words beside it about. */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 :focus-visible {
@@ -401,6 +406,27 @@ button:disabled {
   cursor: default;
 }
 
+/* A press gives way under the finger: the key sinks a little and comes back.
+   Scale rather than transform, so it never fights a key's own transform. */
+button {
+  transition: scale 120ms ease-out;
+}
+
+button:active:not(:disabled) {
+  scale: 0.96;
+}
+
+/* Rows of a list are pointed at, not pressed: they keep still. */
+.pickoption:active:not(:disabled) {
+  scale: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button:active:not(:disabled) {
+    scale: none;
+  }
+}
+
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -436,40 +462,69 @@ button.primary:hover:not(:disabled) {
    busy lamp runs at — so the guidance reads as a lamp rather than as another
    piece of the control. It stands off by a couple of pixels rather than hugging
    the control, because that strip of background is what makes it a ring. */
-.pulse::after {
+.pulse::after,
+.pulse::before {
   content: '';
   position: absolute;
   inset: -4px;
-  border: 2px solid #e8a33d;
   border-radius: 6px;
   pointer-events: none;
+}
+
+.pulse::after {
+  border: 2px solid #e8a33d;
   animation: pulsering 1.6s ease-out infinite;
 }
 
-.pulse:disabled::after {
+/* The halo is its own element with a static shadow, so that both layers can
+   be animated on the compositor: a box-shadow or border-color keyframe
+   repaints the control's neighbourhood every frame for as long as the hint is
+   showing, where opacity and scale are only a change of the layer's matrix. */
+.pulse::before {
+  box-shadow: 0 0 0 7px rgba(232, 163, 61, 0.5);
+  opacity: 0;
+  animation: pulsehalo 1.6s ease-out infinite;
+}
+
+.pulse:disabled::after,
+.pulse:disabled::before {
   display: none;
 }
 
 /* An annunciator ping: the ring comes up to full, then throws a halo outward
-   off its own edge as it settles back. Colour and halo are animated rather
-   than opacity, so the two peak together instead of the ring dimming the very
-   halo it is throwing — and the halo is spread on a shadow rather than a
-   second element, so nothing around the control moves. */
+   off its own edge as it settles back. The ring only changes opacity, and the
+   halo swells and fades, so the two peak together instead of the ring dimming
+   the very halo it is throwing — and nothing around the control moves. */
 @keyframes pulsering {
   0%,
   100% {
-    border-color: rgba(232, 163, 61, 0.5);
-    box-shadow: 0 0 0 0 rgba(232, 163, 61, 0);
+    opacity: 0.5;
   }
 
   35% {
-    border-color: rgba(232, 163, 61, 1);
-    box-shadow: 0 0 0 0 rgba(232, 163, 61, 0.5);
+    opacity: 1;
   }
 
   75% {
-    border-color: rgba(232, 163, 61, 0.8);
-    box-shadow: 0 0 0 10px rgba(232, 163, 61, 0);
+    opacity: 0.8;
+  }
+}
+
+@keyframes pulsehalo {
+  0%,
+  35%,
+  100% {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+
+  55% {
+    opacity: 0.6;
+  }
+
+  75% {
+    opacity: 0;
+    transform: scale(1);
   }
 }
 
@@ -479,6 +534,7 @@ button.primary:hover:not(:disabled) {
    mark: present enough to be found, quiet enough that a faceplate full of them
    still reads as controls. It lights up once it has been opened. */
 button.infodot {
+  position: relative;
   flex: none;
   display: inline-flex;
   align-items: center;
@@ -503,6 +559,14 @@ button.infodot.on {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+/* The dot is drawn small; it is hit larger, so it is not a hunt for the
+   cursor beside a label. */
+button.infodot::before {
+  content: '';
+  position: absolute;
+  inset: -5px;
 }
 
 button.infodot:focus-visible {
@@ -690,6 +754,12 @@ button.x {
   color: var(--faint);
 }
 
+/* A dialog's close is a target of its own, not a glyph to aim at. */
+.modalhead button.x {
+  min-width: 32px;
+  min-height: 32px;
+}
+
 button.x:hover:not(:disabled) {
   color: var(--red);
   background: var(--well-deep);
@@ -713,6 +783,120 @@ select {
 
 select:disabled {
   color: var(--dim);
+}
+
+select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Every dropdown in the app — the panel's, the dialogs', the plugins' — is a
+   <select>, and the browser draws the list that opens from one in its own
+   chrome (system blue, system font). Where the browser lets the page style it
+   (`appearance: base-select`, Chromium), the closed face and the open list take
+   the picker's look (ui/RefPicker, .picklist/.pickoption above), so no dropdown
+   stands apart from the instrument. Elsewhere the native select stays as it
+   was. */
+@supports (appearance: base-select) {
+  select,
+  select::picker(select) {
+    appearance: base-select;
+  }
+
+  select {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    cursor: pointer;
+  }
+
+  select::picker-icon {
+    content: '▾';
+    color: var(--dim);
+    font-size: 11px;
+    transition: rotate 120ms ease;
+  }
+
+  select:open::picker-icon {
+    rotate: 180deg;
+  }
+
+  select:open {
+    border-color: var(--accent);
+  }
+
+  select:disabled {
+    cursor: default;
+  }
+
+  select::picker(select) {
+    font-family: var(--ui);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    padding: 3px;
+    margin: 3px 0;
+    max-height: 260px;
+    min-width: anchor-size(width);
+    top: anchor(bottom);
+    position-try-fallbacks: flip-block;
+  }
+
+  select option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    padding: 5px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+    color: var(--ink);
+    background: none;
+  }
+
+  select option:hover,
+  select option:focus-visible,
+  select option:checked:focus-visible {
+    background: var(--accent);
+    color: #fff;
+    outline: none;
+  }
+
+  select option:checked {
+    font-weight: 600;
+  }
+
+  select option:disabled {
+    color: var(--dim);
+    cursor: default;
+  }
+
+  select option:disabled:hover {
+    background: none;
+    color: var(--dim);
+  }
+
+  select option::checkmark {
+    display: none;
+  }
+
+  select optgroup {
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--dim);
+    padding: 5px 7px 2px;
+  }
+
+  select optgroup option {
+    text-transform: none;
+    letter-spacing: 0;
+  }
 }
 
 /* ---------------- left panel ---------------- */
@@ -1159,6 +1343,13 @@ button.primary svg.icon .i-adt,
   text-overflow: ellipsis;
 }
 
+/* A name too long for its key goes onto two lines rather than losing its
+   end — "Patch network" in a four-across row. */
+.kindrow.featurekeys:not(.three) button span {
+  white-space: normal;
+  text-wrap: balance;
+}
+
 /* A key with a picture beside its word. */
 button.withicon {
   white-space: nowrap;
@@ -1329,6 +1520,15 @@ button.x:disabled {
 }
 
 .kv b.warn {
+  color: var(--amber);
+}
+
+.kv b.error,
+.kv.tone-error .name {
+  color: var(--red);
+}
+
+.kv.tone-warn .name {
   color: var(--amber);
 }
 
@@ -1615,6 +1815,12 @@ button.x:disabled {
   box-shadow: 0 1px 3px rgba(18, 22, 26, 0.14);
 }
 
+.viewfit::before {
+  content: '';
+  position: absolute;
+  inset: -5px;
+}
+
 .viewfit:hover {
   opacity: 1;
   color: var(--accent-d);
@@ -1636,6 +1842,11 @@ button.x:disabled {
    viewport's size, so the scene publishes it — see SceneManager.drawGizmo. */
 .viewport > .viewfit {
   bottom: calc(var(--gizmo-size, 0px) + 22px);
+}
+
+/* Parallel or perspective, just left of Fit to view. */
+.viewport > .viewprojection {
+  right: 50px;
 }
 
 /* WebGL could not be started: the one state where the stage has nothing to
@@ -1718,6 +1929,60 @@ button.x:disabled {
   text-overflow: ellipsis;
 }
 
+/* A plugin's word from outside its own workspace (PluginRuntime.elsewhere):
+   under the hint chip, so the two never cover each other, and a card rather
+   than a chip, since it carries buttons. */
+.stagenotes {
+  position: absolute;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(560px, calc(100% - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 5;
+}
+
+.stagenote {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  background: rgba(var(--glass), 0.96);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.stagenote .note-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.stagenote .note-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.stagenote button.x {
+  min-width: 26px;
+  min-height: 26px;
+  font-size: 16px;
+}
+
+@media (max-width: 700px) {
+  .stagenote {
+    flex-wrap: wrap;
+  }
+}
+
 /* The uncalibrated alarm on the 2D Measure stage. Deliberately louder than a
    hint chip: every number in that workspace rests on the scale, so an
    unverified scale is a fact about the measurements, not a tip. */
@@ -1764,6 +2029,29 @@ button.x:disabled {
 .flat-band.box.crossing {
   border: 1px dashed #4db8ff;
   background: rgba(77, 184, 255, 0.12);
+}
+
+/* Ctrl, Command or Shift held: the box adds to the selection — a + in its
+   corner and a heavier border, in the box's own colour. */
+.flat-band.box.window {
+  color: #3cb371;
+}
+
+.flat-band.box.crossing {
+  color: #4db8ff;
+}
+
+.flat-band.box.additive {
+  border-width: 2px;
+}
+
+.flat-band.box.additive::after {
+  content: '+';
+  position: absolute;
+  top: 1px;
+  right: 4px;
+  font: 700 18px/1 var(--mono);
+  color: currentColor;
 }
 
 .loupe {
@@ -2575,6 +2863,11 @@ button.x:disabled {
     animation: none;
     opacity: 1;
   }
+
+  .pulse::before {
+    animation: none;
+    display: none;
+  }
 }
 
 /* ---------------- modals ---------------- */
@@ -2613,6 +2906,7 @@ button.x:disabled {
 .modal h2 {
   margin: 0;
   font-size: 16px;
+  text-wrap: balance;
 }
 
 .modal h3 {
@@ -2713,6 +3007,20 @@ button.x:disabled {
 .setting > input[type='text'] {
   width: 100%;
   max-width: 240px;
+}
+
+/* Fields drawn the way the panel's are, not the browser's bevel. */
+.setting > input[type='number'],
+.setting > input[type='text'] {
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--well);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 5px 7px;
+  box-shadow: var(--inset);
 }
 
 .setting > small code {
@@ -2875,8 +3183,9 @@ button.x:disabled {
 
 /* ---------------- units of an STL ---------------- */
 
+/* Wide enough for the four units side by side beside their label. */
 .modal.units {
-  width: 480px;
+  width: 520px;
 }
 
 .modal.units > p.dim {
@@ -3116,7 +3425,8 @@ button.x:disabled {
 }
 
 .field input[type='number'],
-.field input[type='text'] {
+.field input[type='text'],
+.field input[type='password'] {
   font-family: var(--mono);
   font-size: 12px;
   color: var(--ink);
@@ -3796,6 +4106,7 @@ button.x:disabled {
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--faint);
+  text-wrap: balance;
 }
 
 .starttiles {
@@ -3861,6 +4172,19 @@ button.x:disabled {
 }
 
 .startfoot {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.startsample {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+}
+
+.startsample small {
   font-size: 11.5px;
   color: var(--faint);
 }
@@ -4144,8 +4468,15 @@ button.x:disabled {
   color: var(--dim);
 }
 
+.exportmesh .picklist {
+  left: auto;
+  min-width: 100%;
+  width: max-content;
+}
+
 .exportmesh .pickoption {
   display: block;
+  white-space: nowrap;
   width: 100%;
   text-align: left;
   font-family: var(--ui);
@@ -4159,4 +4490,62 @@ button.x:disabled {
 .exportmesh .pickoption:focus-visible {
   background: var(--accent);
   color: #fff;
+}
+
+/* A list row's right-click menu, opened where the pointer is. */
+.ctx-menu {
+  position: fixed;
+  z-index: 60;
+  width: 200px;
+  padding: 4px 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--panel);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.17);
+}
+
+.ctx-head {
+  padding: 3px 12px 5px;
+  font-family: var(--cond);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctx-menu button {
+  display: block;
+  width: 100%;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--ink);
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ctx-menu button.rule {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.ctx-menu button:hover:not(:disabled) {
+  background: var(--well);
+  color: var(--accent-d);
+}
+
+.ctx-menu button.danger:hover:not(:disabled) {
+  color: var(--red);
+}
+
+.ctx-menu button:disabled {
+  color: var(--faint);
+  cursor: default;
 }

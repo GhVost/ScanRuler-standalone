@@ -4,13 +4,16 @@
 // What each layer draws is computed by app/flatSheet — this hook only
 // decides when to push. The 3D twin is useSceneSync.
 
-import { useEffect, type MutableRefObject } from 'react'
+import { useEffect, useRef, type MutableRefObject } from 'react'
 import type { EdgeChains } from '../core/flat/edges'
 import type { Vec2 } from '../core/flat/types'
+import type { CurvatureRun } from '../core/flat/curvature'
+import { useComb } from '../state/combStore'
 import { useFlat } from '../state/flatStore'
 import { usePrefs } from '../state/prefsStore'
 import { useStore } from '../state/store'
 import type { FlatScene } from '../viewer/FlatScene'
+import { EDGE_COMB_COLOR, formatCurvature, imageSourceRuns, sectionSourceRuns, sheetComb } from './curvatureCombs'
 import {
   sheetAlignment,
   sheetCalibrationPicks,
@@ -51,6 +54,41 @@ export function useFlatSceneSync({
     const s = useFlat.getState()
     scene()?.setEdgeChains(s.showEdges ? (sheetOf()?.chains ?? null) : null)
   }
+  /** The curvature comb, while it is on: along the subject's edges while
+   *  they are shown, and along every visible arc, circle and spline, each in
+   *  its own colour — the reach taken from the edges whether they are shown
+   *  or not, so hiding them leaves a spline's teeth as long as they were. */
+  const pushComb = () => {
+    const view = scene()
+    if (!view) return
+    const comb = useComb.getState()
+    if (!comb.on) {
+      view.setCurvatureComb(null)
+      return
+    }
+    const s = useFlat.getState()
+    let source: CurvatureRun[] = []
+    const subject = s.subject
+    if (subject.kind === 'section') {
+      const sec = useStore.getState().sections.find((x) => x.id === subject.id)
+      if (sec?.cut) source = sectionSourceRuns(sec.cut, sec.frame, comb.window)
+    } else {
+      const chains = sheetOf()?.chains
+      if (chains) source = imageSourceRuns(chains, sheetScale(s), comb.window)
+    }
+    const elements = sheetElements(s, units)
+    const { source: edges, elements: curves, reach } = sheetComb(source, elements.map((e) => e.fit), comb.window, comb.scale)
+    const layers = elements.map((e) => ({ runs: [] as CurvatureRun[], color: e.color }))
+    for (const run of curves) layers[run.source].runs.push(run)
+    if (s.showEdges) layers.unshift({ runs: edges, color: EDGE_COMB_COLOR })
+    // An image not yet calibrated is measured in its pixels.
+    const inPx = subject.kind === 'image' && !s.pxPerMm
+    view.setCurvatureComb({
+      layers,
+      reach,
+      format: (r) => (inPx && r.radius !== null ? `R ${r.radius.toFixed(1)} px` : formatCurvature(r, units)),
+    })
+  }
   const pushNotes = () => scene()?.setNotes(sheetNotes(useFlat.getState()))
   const pushCounts = () => scene()?.setCounts(sheetCounts(useFlat.getState()))
   const pushDimensions = () => scene()?.setFlatDimensions(sheetDimensions(useFlat.getState(), units))
@@ -68,6 +106,22 @@ export function useFlatSceneSync({
     view.setRegionMode(draft.regionMode)
   }
 
+  /** What lays the sheet afresh, read off the stores as the effect below keys
+   *  on it: a new image, a new subject, or a section's cut landing. */
+  const sheetKey = () => {
+    const { subject, imageVersion, subjectVersion } = useFlat.getState()
+    const cut =
+      subject.kind === 'section'
+        ? (useStore.getState().sections.find((x) => x.id === subject.id)?.cutKey ?? null)
+        : null
+    return `${imageVersion}|${subjectVersion}|${cut}`
+  }
+  /** The viewport the sheet was last laid on, and under which key — so that
+   *  a kept viewport shown again, whose sheet nothing has changed, is not laid
+   *  again: that would upload the image once more and take the user's pan and
+   *  zoom away. */
+  const laid = useRef<{ view: FlatScene; key: string } | null>(null)
+
   /** Lay the subject on the sheet and every layer over it — once both it
    *  and the viewport exist, in whichever order they got there: the image
    *  may be dropped before the workspace has ever been opened, and the
@@ -76,6 +130,7 @@ export function useFlatSceneSync({
     const sheet = sheetOf()
     const view = scene()
     if (!sheet || !view) return
+    laid.current = { view, key: sheetKey() }
     // The alignment, the mirror and the turn first, so the sheet is framed
     // the way it is to be looked at rather than framed and then turned.
     view.setAlignment(sheetAlignment(useFlat.getState()))
@@ -90,6 +145,7 @@ export function useFlatSceneSync({
     pushCounts()
     pushNotes()
     pushGrid()
+    pushComb()
   }
 
   // A new image, a new subject, or a section's cut landing (a section from a
@@ -137,6 +193,11 @@ export function useFlatSceneSync({
   const mirror = useFlat((s) => s.mirror)
   useEffect(pushElements, [elements, draft, scale, datum, mirror, units])
 
+  const combOn = useComb((s) => s.on)
+  const combWindow = useComb((s) => s.window)
+  const combScale = useComb((s) => s.scale)
+  useEffect(pushComb, [combOn, combWindow, combScale, edgeVersion, showEdges, elements, draft, scale, units])
+
   // The sheet aligned to the part, mirrored, or turned on the stage — the
   // camera moves, nothing is redrawn. The alignment's direction is read at
   // the scale in force: an anisotropic calibration bends it, so a
@@ -146,13 +207,30 @@ export function useFlatSceneSync({
   const turns = useFlat((s) => s.turns)
   useEffect(() => scene()?.setTurns(turns), [turns])
 
+  /** Lay the subject and every layer on a viewport afresh, as when it mounts. */
+  const resync = (view: FlatScene) => {
+    sceneRef.current = view
+    pushAll()
+  }
+  /** A kept viewport is shown again. Every layer was pushed as its store
+   *  changed, hidden or not, so unless the sheet itself was laid anew since
+   *  (which a change while hidden does as well, on the viewport that is there)
+   *  there is nothing to do. */
+  const show = (view: FlatScene) => {
+    if (laid.current?.view === view && laid.current.key === sheetKey()) return
+    resync(view)
+  }
+
   return {
     /** The viewport has mounted — take it and lay the sheet out on it — or
-     *  unmounted with its workspace (null). */
+     *  unmounted (null): with the app, or never before then, as it is kept
+     *  once its workspace has been opened. */
     onReady: (view: FlatScene | null) => {
-      sceneRef.current = view
-      if (view) pushAll()
+      if (view) resync(view)
+      else sceneRef.current = null
     },
+    /** The kept viewport is shown again — see show. */
+    resync: show,
     /** The cursor over the sheet — the alignment tool's live grid preview. */
     onHover: (cursor: Vec2 | null) => {
       const grid = sheetDatumPreview(useFlat.getState(), cursor)

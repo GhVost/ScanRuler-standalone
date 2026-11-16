@@ -15,7 +15,7 @@
 // Env: CHROME (chrome.exe path), APP_URL, SHOT_DIR.
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { canvasRect, check, colouredFraction, drag, fieldSetter, finish, launchApp, loadScan, OUT_DIR, setViewTheme, shotPath, sleep } from '../../../scripts/e2e-lib.mjs'
+import { canvasRect, check, colouredFraction, drag, fieldSetter, finish, launchApp, loadScan, MOD, OUT_DIR, setViewTheme, shotPath, sleep } from '../../../scripts/e2e-lib.mjs'
 import { noisyBoxScan } from '../../../scripts/e2e-fixtures.mjs'
 
 // ---- the scan: a box 30 × 30 × 20 on the XY plane, noisy, with two 3 mm
@@ -139,9 +139,9 @@ const orangeBlobs = async () => {
 // other than the last one's.
 const step = async (key, word) => {
   const before = await page.$eval('.strip .msg', (el) => el.textContent).catch(() => '')
-  await page.keyboard.down('Control')
+  await page.keyboard.down(MOD)
   await page.keyboard.press(key)
-  await page.keyboard.up('Control')
+  await page.keyboard.up(MOD)
   await page.waitForFunction(
     (w, b) => {
       const now = document.querySelector('.strip .msg')?.textContent ?? ''
@@ -333,9 +333,28 @@ await sleep(300)
 await page.click('[data-test=workspace-elements]')
 await sleep(400)
 check((await scanCount()) === opened, '3D Measure still measures the scan as opened')
+// And says so on its stage, with the way back to the copy.
+const note = await text('[data-test=edited-copy-note]')
+console.log('note:', note)
+check(/edited copy/.test(note) && /5 edits/.test(note), 'the stage says an edited copy with five edits is not in use')
+await page.screenshot({ path: shotPath('mesh-edits-note.png') })
+await page.click('[data-test=edited-note-show]')
+await sleep(300)
+check((await copyCount()) === deleted, 'Show goes to Mesh Tools, which still shows the copy')
+check(!(await page.$('[data-test=edited-copy-note]')), 'with no note in its own workspace')
+// Hidden, it stays hidden for that copy.
+await page.click('[data-test=workspace-elements]')
+await sleep(300)
+await page.click('[data-test=edited-note-dismiss]')
+await sleep(200)
+check(!(await page.$('[data-test=edited-copy-note]')), 'the note can be put away')
 await page.click('[data-test=workspace-mesh]')
 await sleep(300)
-check((await copyCount()) === deleted, 'and Mesh Tools still shows the copy')
+await page.click('[data-test=workspace-elements]')
+await sleep(300)
+check(!(await page.$('[data-test=edited-copy-note]')), 'and does not come back for the same copy')
+await page.click('[data-test=workspace-mesh]')
+await sleep(300)
 
 await page.click('[data-test=use-edited]')
 await page.waitForFunction(() => document.querySelectorAll('[data-test=scan-edit]').length === 5, { timeout: 300_000 })

@@ -47,6 +47,23 @@ const REFUSED = new Set([4001, 4003, 4008, 4009])
 /** How long the page waits before trying again, doubling to ten seconds. */
 const retryDelay = (attempt: number) => Math.min(10_000, 1000 * 2 ** attempt)
 
+/** How long the hello may take before the page says what it is waiting
+ *  for. A server on this computer answers at once; a hello that hangs is the
+ *  browser holding it, most often on its question whether this site may
+ *  reach apps on this computer — easy to miss, and the console says nothing
+ *  meanwhile (issue 100). */
+export const HELLO_SLOW_MS = 3000
+
+/** What the link says while the browser holds the hello. */
+export const BROWSER_ASKING =
+  'Waiting for the browser to let this page reach apps on this computer. If it asks, allow it; if it asked before and was told no, allow local network access in the site settings (the icon left of the address), then reload.'
+
+/** What the link says while nothing answers the hello. */
+export const nothingAnswers = (port: number): string =>
+  `Nothing answers on port ${port} on this computer yet. Is the AI app running, with ScanRuler's connector (scanruler-mcp) on that port? ` +
+  '"npx -y scanruler-mcp@latest --pair" prints the port and the token. In Safari, or where the browser will not let this site reach this computer, ' +
+  'open the page "scanruler-mcp --serve" gives instead.'
+
 export interface BridgeOptions {
   port: number
   token: string
@@ -54,6 +71,8 @@ export interface BridgeOptions {
   socket?: (url: string) => WebSocket
   /** Whether the server's hello answers — a test's own, or a fetch. */
   reach?: (url: string) => Promise<boolean>
+  /** How long the hello may take before the link says the browser holds it. */
+  slowMs?: number
 }
 
 /** Fetch the server's hello as a request to this computer, which is what
@@ -95,21 +114,25 @@ const tabHidden = () => typeof document !== 'undefined' && document.visibilitySt
 
 /** Connect to the agent's server, and keep connecting while switched on.
  *  The returned function switches it off. */
-export function startBridge({ port, token, socket = (url) => new WebSocket(url), reach = fetchHello }: BridgeOptions): () => void {
+export function startBridge({ port, token, socket = (url) => new WebSocket(url), reach = fetchHello, slowMs = HELLO_SLOW_MS }: BridgeOptions): () => void {
   let stopped = false
   let ws: WebSocket | null = null
   let attempt = 0
   let timer: ReturnType<typeof setTimeout> | undefined
   let refusal: string | null = null
 
-  const send = (message: Message, binaryPath?: string) => {
-    if (!ws || ws.readyState !== 1) return
+  /** Send on the open connection — or, given `on`, only while `on` is still
+   *  that connection: an answer belongs to the server that asked, and a
+   *  server started again since counts its ids from 1 again. */
+  const send = (message: Message, binaryPath?: string, on: WebSocket | null = ws) => {
+    if (!ws || ws !== on || ws.readyState !== 1) return
     for (const frame of encode(message, binaryPath)) ws.send(frame as string | ArrayBufferView<ArrayBuffer>)
   }
 
-  const run = async (message: Message) => {
+  const run = async (message: Message, from: WebSocket) => {
     const id = message.id
-    const progress = (text: string) => send({ event: 'progress', id, text })
+    const reply = (answer: Message, binaryPath?: string) => send(answer, binaryPath, from)
+    const progress = (text: string) => reply({ event: 'progress', id, text })
     // What the status line says while the command runs, the agent hears too.
     const quiet = useStore.subscribe((s, prev) => {
       if (s.statusText && s.statusText !== prev.statusText) progress(s.statusText)
@@ -118,9 +141,9 @@ export function startBridge({ port, token, socket = (url) => new WebSocket(url),
       const job = typeof message.job === 'string' && message.job ? message.job : undefined
       const result = await runCommand(String(message.name), message.input ?? {}, progress, job, message.deferred === true)
       const file = (result as { file?: { bytes?: unknown } } | null)?.file
-      send({ id, result: result as unknown }, file?.bytes instanceof Uint8Array ? 'result.file.bytes' : undefined)
+      reply({ id, result: result as unknown }, file?.bytes instanceof Uint8Array ? 'result.file.bytes' : undefined)
     } catch (e) {
-      send({
+      reply({
         id,
         error: e instanceof CommandError ? e.toJSON() : { code: 'internal', message: e instanceof Error ? e.message : String(e) },
       })
@@ -129,7 +152,7 @@ export function startBridge({ port, token, socket = (url) => new WebSocket(url),
     }
   }
 
-  const receive = (message: Message) => {
+  const receive = (message: Message, from: WebSocket) => {
     if (message.welcome) {
       attempt = 0
       refusal = null
@@ -141,9 +164,9 @@ export function startBridge({ port, token, socket = (url) => new WebSocket(url),
     } else if (typeof message.refused === 'string') {
       refusal = message.refused
     } else if (message.method === 'run') {
-      void run(message)
+      void run(message, from)
     } else if (message.method === 'list') {
-      send({ id: message.id, result: listCommands() })
+      send({ id: message.id, result: listCommands() }, undefined, from)
     }
   }
 
@@ -153,23 +176,35 @@ export function startBridge({ port, token, socket = (url) => new WebSocket(url),
     const { registerCoreCommands } = await import('./core')
     registerCoreCommands()
     if (stopped) return
-    if (useAgentLink.getState().status !== 'refused') useAgentLink.setState({ status: 'waiting', detail: null })
+    // Waiting already, it keeps saying why until something changes.
+    const was = useAgentLink.getState().status
+    if (was !== 'refused' && was !== 'waiting') useAgentLink.setState({ status: 'waiting', detail: null })
+    const stillWaiting = () => !stopped && useAgentLink.getState().status === 'waiting'
+    const slow = setTimeout(() => {
+      if (stillWaiting()) useAgentLink.setState({ detail: BROWSER_ASKING })
+    }, slowMs)
     const answered = onThisComputer() || (await reach(`http://127.0.0.1:${port}/scanruler-mcp`))
+    clearTimeout(slow)
     if (stopped) return
+    if (answered && useAgentLink.getState().detail === BROWSER_ASKING) useAgentLink.setState({ detail: null })
     if (!answered) {
-      if (typeof navigator !== 'undefined' && navigator.permissions && (await loopbackDenied())) {
+      const denied = typeof navigator !== 'undefined' && !!navigator.permissions && (await loopbackDenied())
+      // The link may have been switched off while the browser answered; a
+      // stopped link stays off rather than showing a refusal or retrying.
+      if (stopped) return
+      if (denied) {
         useAgentLink.setState({
           status: 'refused',
           detail: 'The browser keeps this site from reaching apps on this computer — allow local network access for it in the site settings (the icon left of the address), then reload.',
         })
-      }
+      } else if (stillWaiting()) useAgentLink.setState({ detail: nothingAnswers(port) })
       timer = setTimeout(() => void connect(), retryDelay(attempt++))
       return
     }
     const here = socket(`ws://127.0.0.1:${port}/`)
     ws = here
     here.binaryType = 'arraybuffer'
-    const read = decoder(receive)
+    const read = decoder((message) => receive(message, here))
     here.onopen = () =>
       send({
         hello: {

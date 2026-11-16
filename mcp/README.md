@@ -153,6 +153,15 @@ the sentence the banner gives you to paste, or change the setting to the
 `@latest` line it shows. Then quit the app completely — not just its window —
 and open it again.
 
+When the page is updated while the app runs, the tools the app was given are
+the old page's, and `scanruler_status` says so (`tools.stale`, with what was
+added, removed and changed). A new chat does not bring the new ones: Claude
+Desktop keeps one server for as long as it runs and does not list the tools
+again when told they changed. Quit the app completely — in Claude Desktop,
+**Quit** from its tray or menu-bar icon, not just closing the window — and open
+it again; the server it starts lists the page's current tools. Until then,
+`scanruler_batch` runs any of the page's tools by name, new ones included.
+
 ### Several agents
 
 Any number of copies of the server can share the tab. The first to start
@@ -321,7 +330,9 @@ for it), `scanruler_wait` (until a tab is connected, or also idle),
 of `scan_nearest` or `element_fit` calls — each answer in its place, stopped
 at the first refused unless told to go on), `scanruler_write` (a text
 file — `.md`, `.txt`, `.csv` or `.json`, a report say — written in the folder
-the server last opened a scan or a project from, and nowhere else) and
+the server last opened a scan or a project from, and nowhere else: not into
+hidden folders, and not as a file agents and tools take instructions or
+settings from, such as `CLAUDE.md`, `AGENTS.md` or `package.json`) and
 `scanruler_files` (that folder's files — name, size, kind — newest first), `scanruler_read` (a text file there, or an answer too long to carry wherever it was written, in parts: `{ text, offset, nextOffset, size }`, in bytes).
 The folders are kept beside `tools.json` (`folders.json`), so a server
 started afresh still writes and lists there, and `scanruler_status` lists
@@ -351,15 +362,21 @@ namespaces, only the tab's tools of those namespaces, or all but those — see
 - **Arguments from a file.** `{ "$file": path }` anywhere in a tool's
   arguments — an object of that one key — is replaced by the JSON the file
   holds: a long list of stations a script wrote need not pass through the
-  conversation.
-- **Relative paths** — a batch's `file`, `$file`, a file to open, an
-  output's `path` — are taken from the open scan's folder, or from the folder
+  conversation. With `"$at": "loops.0.points"` beside it, only the part of the
+  JSON at that path (keys and list indices by dots).
+- **Answers to a file.** A batch call with `to: "outline.json"` writes its
+  answer to that file, whole, and the batch's result says where and what the
+  answer holds — a long reading (an outline's loops, a height grid) fed on to
+  a later call by `$file` and `$at`, never carried through the conversation.
+  A file already there is replaced.
+- **Relative paths** — a batch's `file`, `$file`, a call's `to`, a file to
+  open, an output's `path` — are taken from the open scan's folder, or from the folder
   the server was started in while no scan is open; `scanruler_status` gives
   both (`server.relativeTo`, `server.cwd`). A picture or file written into a
   folder is numbered past one already there (`-2`, `-3`), never written over.
 - **Long answers.** An answer past what one carries (40 k characters; a
-  guide 90 k — several guides asked for together come while they fit about
-  80 k, the rest named in `next`) is written whole to a JSON file in
+  guide 70 k — several guides asked for together come while they fit about
+  60 k, the rest named in `next`) is written whole to a JSON file in
   `scanruler-work` in the open scan's folder — the server's own files, apart
   from the person's, where an agent that may only read there can open it —
   in the output folder (`--out`) while the scan open now was not opened from

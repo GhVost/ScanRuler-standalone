@@ -48,6 +48,8 @@ import type { Vec3 } from '../../../src/core/types'
 import { SECTION_LINE_DEFAULT } from '../../../src/viewer/lineWidths'
 import { LineWidthRegistry } from '../../../src/viewer/lineWidthRegistry'
 import { pinLabel } from '../../../src/viewer/pinLabel'
+import { sparingRays } from '../../../src/viewer/bvh'
+import { modHeld } from '../../../src/ui/platform'
 import type { SceneManager } from '../../../src/viewer/SceneManager'
 import type { SceneLayer, SceneLayerHost } from '../../../src/viewer/sceneLayers'
 import { type NetworkReport, PATCH_GRID } from '../core/networkBody'
@@ -195,6 +197,8 @@ export class NetworkLayer {
   private paths: ScanPaths | null = null
   private draft: Draft | null = null
   private report: NetworkReport | null = null
+  /** Whether `report` is of the draft as it stands — see setDraft. */
+  private reportCurrent = true
   private color = CURVE_COLOR
   private curves = new Map<number, DrawnCurve>()
   private dots: THREE.Points | null = null
@@ -283,12 +287,14 @@ export class NetworkLayer {
   }
 
   /** The draft to draw, and the last build's report on it; null puts the
-   *  layer away. */
-  setDraft(d: Draft | null, report: NetworkReport | null, color: string): void {
+   *  layer away. `current`: the report is of the draft as it stands, not
+   *  of one before a change whose build still runs. */
+  setDraft(d: Draft | null, report: NetworkReport | null, color: string, current = true): void {
     const was = this.draft
     const reported = this.report
     this.draft = d
     this.report = report
+    this.reportCurrent = current
     this.color = color
     if (!d) {
       this.clearAll()
@@ -707,7 +713,9 @@ export class NetworkLayer {
    *  has; false where there is none. */
   private deletePatch(patch: number | null): boolean {
     const report = this.report
-    if (patch === null || !report?.patches[patch]) return false
+    // A report of the draft before a change still building numbers its
+    // patches as they were: deleting by it takes the wrong one (issue 34).
+    if (patch === null || !this.reportCurrent || !report?.patches[patch]) return false
     this.edit((x) => removeReportedPatch(x, report, patch))
     this.hovered = null
     return true
@@ -788,7 +796,7 @@ export class NetworkLayer {
   private projector(): (p: ArrayLike<number>, i?: number) => { x: number; y: number } {
     const camera = this.host.camera()
     const e = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).multiply(this.host.partGroup.matrixWorld).elements
-    const r = this.host.canvas.getBoundingClientRect()
+    const r = this.host.canvasRect()
     return (p, i = 0) => {
       const x = p[i], y = p[i + 1], z = p[i + 2]
       const w = e[3] * x + e[7] * y + e[11] * z + e[15]
@@ -1015,7 +1023,10 @@ export class NetworkLayer {
       const ev = latest
       latest = null
       if (!ev) return
-      const on = this.host.pickScan(ev.clientX, ev.clientY)
+      // A frame's test, like the hover: while the scan's tree is still on
+      // its way it meets nothing, and what is dragged stays where it was —
+      // see bvh.ts sparingRays.
+      const on = sparingRays(() => this.host.pickScan(ev.clientX, ev.clientY))
       if (!on) return
       const at = on.point
       const h = hit
@@ -1061,7 +1072,7 @@ export class NetworkLayer {
           const outline = joined(q.sides)
           const seed = seedInside(this.paths, outline)
           this.edit((x) => this.waitFor(outline, x, addPatch(x, q.corners, { closed: true, seed, vias: q.vias })))
-        } else if (!moved) this.click(ev.clientX, ev.clientY, ev.ctrlKey)
+        } else if (!moved) this.click(ev.clientX, ev.clientY, modHeld(ev))
         this.drawPreview(null)
         this.host.invalidate()
         return
@@ -1078,7 +1089,7 @@ export class NetworkLayer {
       }
       // The press was taken, so the viewport makes no click of it: one that
       // never moved is a click on what it pressed — a corner there.
-      else this.click(ev.clientX, ev.clientY, ev.ctrlKey)
+      else this.click(ev.clientX, ev.clientY, modHeld(ev))
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
